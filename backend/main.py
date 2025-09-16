@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List
 import json
 
@@ -123,8 +123,8 @@ async def start_challenge(request: ChallengeRequest):
         challenge_url=str(request.url),
         flag_format=request.flag_format,
         status=ChallengeStatus.PENDING,
-        created_at=datetime.now(),
-        updated_at=datetime.now()
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc)
     )
     
     sessions[session_id] = session
@@ -169,7 +169,7 @@ async def stop_challenge(session_id: str):
                 logger.error(f"Failed to cleanup container for session {session_id}: {e}")
         
         session.status = ChallengeStatus.FAILED
-        session.updated_at = datetime.now()
+        session.updated_at = datetime.now(timezone.utc)
         session.error_message = "Stopped by user"
     
     return {"status": "stopped"}
@@ -216,7 +216,7 @@ async def solve_challenge_background(session_id: str, request: ChallengeRequest)
     """Background task to solve challenge."""
     session = sessions[session_id]
     session.status = ChallengeStatus.RUNNING
-    session.updated_at = datetime.now()
+    session.updated_at = datetime.now(timezone.utc)
     
     # WebSocket callback for real-time updates
     async def websocket_callback(event_type: str, data: dict):
@@ -224,7 +224,7 @@ async def solve_challenge_background(session_id: str, request: ChallengeRequest)
         if event_type == "action" and "timestamp" in data:
             action = AgentAction(**data)
             session.actions.append(action)
-            session.updated_at = datetime.now()
+            session.updated_at = datetime.now(timezone.utc)
             logger.info(f"Added action to session {session_id}: {data.get('action_type', 'unknown')}")
         
         message = WebSocketMessage(
@@ -247,7 +247,7 @@ async def solve_challenge_background(session_id: str, request: ChallengeRequest)
         
         # Update session with results
         session.actions = actions
-        session.updated_at = datetime.now()
+        session.updated_at = datetime.now(timezone.utc)
         
         # Check if flag was found
         flag_found = any(action.action_type == "flag_found" for action in actions)
@@ -263,7 +263,7 @@ async def solve_challenge_background(session_id: str, request: ChallengeRequest)
         logger.error(f"Challenge solving failed for session {session_id}: {e}")
         session.status = ChallengeStatus.FAILED
         session.error_message = str(e)
-        session.updated_at = datetime.now()
+        session.updated_at = datetime.now(timezone.utc)
         
         # Send error via WebSocket
         error_message = WebSocketMessage(

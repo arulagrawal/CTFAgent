@@ -1,6 +1,6 @@
 from pydantic import BaseModel, HttpUrl
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 
 
@@ -54,4 +54,4 @@ class WebSocketMessage(BaseModel):
     type: str  # "action", "status", "flag_found", "error"
     session_id: str
     data: Dict[str, Any]
-    timestamp: datetime = datetime.now()
+    timestamp: datetime = datetime.now(timezone.utc)

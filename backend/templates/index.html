@@ -384,6 +384,7 @@ function updateSessionStatus(session) {
     
     // Update duration
     if (session.created_at) {
+        // Parse the UTC timestamp correctly
         startTime = new Date(session.created_at);
         updateDuration();
     }

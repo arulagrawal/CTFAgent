@@ -3,7 +3,7 @@ import logging
 import re
 import json
 from typing import List, Dict, Any, Optional, Callable
-from datetime import datetime
+from datetime import datetime, timezone
 import openai
 from openai import AsyncOpenAI
 
@@ -106,7 +106,7 @@ class CTFAgent:
             # Send initial status update
             if callback:
                 init_action = AgentAction(
-                    timestamp=datetime.now(),
+                    timestamp=datetime.now(timezone.utc),
                     action_type="session_initialized",
                     output=f"CTF Agent session started for {challenge_url}\nFlag format: {flag_format}\nContainer created successfully",
                     reasoning="Session initialization and container setup",
@@ -132,7 +132,7 @@ class CTFAgent:
                 flag = self._check_for_flag(actions, flag_format)
                 if flag:
                     flag_action = AgentAction(
-                        timestamp=datetime.now(),
+                        timestamp=datetime.now(timezone.utc),
                         action_type="flag_found",
                         output=f"Flag found: {flag}",
                         reasoning="Flag pattern matched in previous outputs",
@@ -156,6 +156,26 @@ class CTFAgent:
                 # Add a small delay between iterations to ensure frontend updates
                 await asyncio.sleep(1)
                 
+                # Detect if AI is repeating commands (loop detection)
+                recent_commands = [action.command for action in actions[-6:] if action.command]
+                if len(recent_commands) >= 4:
+                    # Check if we're repeating similar commands
+                    command_similarity = sum(1 for cmd1 in recent_commands[-2:] for cmd2 in recent_commands[-4:-2] 
+                                           if cmd1 and cmd2 and (cmd1 == cmd2 or cmd1.split()[0] == cmd2.split()[0]))
+                    if command_similarity >= 2:
+                        logger.warning(f"Detected potential command repetition. Similarity score: {command_similarity}")
+                        # Add a hint to break the loop
+                        loop_hint_action = AgentAction(
+                            timestamp=datetime.now(timezone.utc),
+                            action_type="system_hint",
+                            output="SYSTEM HINT: You may be repeating similar commands. Try a completely different approach or tool. Focus on exploiting any discovered vulnerabilities rather than more reconnaissance.",
+                            reasoning="Loop detection triggered",
+                            success=True
+                        )
+                        actions.append(loop_hint_action)
+                        if callback:
+                            await callback("action", loop_hint_action.dict())
+                
                 # Prevent infinite loops
                 if not iteration_actions or all(not action.success for action in iteration_actions[-3:]):
                     break
@@ -164,7 +184,7 @@ class CTFAgent:
             
         except Exception as e:
             error_action = AgentAction(
-                timestamp=datetime.now(),
+                timestamp=datetime.now(timezone.utc),
                 action_type="error",
                 output=str(e),
                 reasoning="Exception occurred during challenge solving",
@@ -208,7 +228,7 @@ class CTFAgent:
                 model=self.model,
                 messages=messages,
                 max_completion_tokens=10000,  # Further increased to prevent truncation
-                reasoning_effort="high"  # Reduced reasoning effort to save tokens for response
+                reasoning_effort="medium"  # Reduced reasoning effort to save tokens for response
             )
             
             ai_response = response.choices[0].message.content
@@ -220,7 +240,7 @@ class CTFAgent:
             if not ai_response or ai_response.strip() == "":
                 logger.warning("AI returned empty response, likely due to token limits")
                 error_action = AgentAction(
-                    timestamp=datetime.now(),
+                    timestamp=datetime.now(timezone.utc),
                     action_type="ai_empty_response",
                     output=f"AI returned empty response. Finish reason: {response.choices[0].finish_reason}. Usage: {response.usage}",
                     reasoning="AI hit token limits or returned empty content",
@@ -252,7 +272,7 @@ class CTFAgent:
                 
                 # Create a more informative action with the full AI response
                 error_action = AgentAction(
-                    timestamp=datetime.now(),
+                    timestamp=datetime.now(timezone.utc),
                     action_type="ai_response_parsing_failed",
                     output=f"AI provided response but no commands could be extracted.\n\nFull AI Response:\n{ai_response}",
                     reasoning="The AI responded but the response format didn't match expected patterns for command extraction",
@@ -371,7 +391,7 @@ Provide 1-3 concrete shell commands to start analyzing the challenge. Use the ac
                 formatted_output = "\n\n".join(output_parts)
                 
                 action = AgentAction(
-                    timestamp=datetime.now(),
+                    timestamp=datetime.now(timezone.utc),
                     action_type="command_execution",
                     command=command,
                     output=formatted_output,
@@ -389,7 +409,7 @@ Provide 1-3 concrete shell commands to start analyzing the challenge. Use the ac
         
         except Exception as e:
             error_action = AgentAction(
-                timestamp=datetime.now(),
+                timestamp=datetime.now(timezone.utc),
                 action_type="ai_error",
                 output=str(e),
                 reasoning="Failed to get AI response or execute commands",
@@ -515,13 +535,17 @@ Provide your first set of reconnaissance commands with clear reasoning for each.
     def _build_iteration_prompt(self, actions: List[AgentAction], flag_format: str, iteration: int) -> str:
         """Build prompt for iterative solving."""
         import re  # For regex operations
-        recent_actions = actions[-5:] if len(actions) > 5 else actions
+        
+        # Use more actions for context, but intelligently summarize
+        recent_actions = actions[-8:] if len(actions) > 8 else actions
+        all_commands = [action.command for action in actions if action.command]
         
         # Build context with more intelligent summarization
         context = "PREVIOUS FINDINGS:\n"
         key_findings = []
         successful_commands = []
         failed_commands = []
+        important_discoveries = []
         
         for action in recent_actions:
             if action.success:
@@ -532,13 +556,24 @@ Provide your first set of reconnaissance commands with clear reasoning for each.
                     if stdout_match:
                         stdout_content = stdout_match.group(1).strip()
                         if stdout_content:
+                            # Check if this is an important discovery
+                            is_important = any(keyword in stdout_content.lower() for keyword in [
+                                'password', 'flag', 'error', 'code:', '$_get', '$_post', 'php', 'sql', 
+                                'admin', 'login', 'token', 'key', 'secret', 'hash', 'md5', 'sha', 
+                                'injection', 'xss', 'csrf', 'directory', 'file', 'path', 'include'
+                            ])
+                            
                             # Provide more context for important findings, less for routine output
                             if len(stdout_content) > 500:
                                 # For long output, provide first 400 chars and last 100 chars
                                 output_preview = stdout_content[:400] + "\n...[truncated]...\n" + stdout_content[-100:]
                             else:
                                 output_preview = stdout_content
-                            key_findings.append(f"From '{action.command}':\n{output_preview}")
+                            
+                            if is_important:
+                                important_discoveries.append(f"IMPORTANT - From '{action.command}':\n{output_preview}")
+                            else:
+                                key_findings.append(f"From '{action.command}':\n{output_preview}")
                     else:
                         # Fallback to original truncation
                         output_preview = action.output[:300] + "..." if len(action.output) > 300 else action.output
@@ -546,11 +581,22 @@ Provide your first set of reconnaissance commands with clear reasoning for each.
             else:
                 failed_commands.append(f"✗ {action.command}")
         
-        context += "\nSuccessful commands:\n" + "\n".join(successful_commands[-3:]) + "\n"
-        if failed_commands:
-            context += "\nFailed commands:\n" + "\n".join(failed_commands[-2:]) + "\n"
+        # Prioritize important discoveries
+        if important_discoveries:
+            context += "\nIMPORTANT DISCOVERIES:\n" + "\n".join(important_discoveries[-2:]) + "\n"
         
-        context += "\nKey findings:\n" + "\n".join(key_findings[-3:]) + "\n"
+        context += "\nSuccessful commands:\n" + "\n".join(successful_commands[-4:]) + "\n"
+        if failed_commands:
+            context += "\nFailed commands:\n" + "\n".join(failed_commands[-3:]) + "\n"
+        
+        if key_findings:
+            context += "\nOther findings:\n" + "\n".join(key_findings[-2:]) + "\n"
+        
+        # Add command history to prevent repetition
+        if len(all_commands) > 0:
+            context += f"\nCOMMANDS ALREADY TRIED ({len(all_commands)} total):\n"
+            context += "\n".join([f"- {cmd}" for cmd in all_commands[-10:]])  # Show last 10 commands
+            context += "\n\nIMPORTANT: Do not repeat these exact commands. Try new approaches or variations.\n"
         
         # Determine what phase we're in
         if iteration == 0:
@@ -576,7 +622,7 @@ CURRENT SITUATION:
 {guidance}
 
 ANALYSIS REQUIRED:
-Look carefully at the command outputs above. What do they reveal?
+Look carefully at the command outputs above. What do they reveal? Focus on the IMPORTANT DISCOVERIES section.
 
 NEXT ACTIONS:
 Based on your findings so far, what should you do next? Consider:
@@ -590,6 +636,17 @@ SPECIFIC GUIDANCE:
 - If you see error messages, look for information disclosure
 - If you see forms or parameters, test for injection vulnerabilities
 - If you see file paths or directories, explore them further
+
+AVOID REPETITION:
+- Review the "COMMANDS ALREADY TRIED" section above
+- Do NOT repeat the exact same commands
+- If you need to retry something, modify the approach (different parameters, tools, etc.)
+- If you're stuck, try a completely different angle or tool
+
+PROGRESS CHECK:
+- Iteration {iteration + 1}/10 - Are you making progress toward finding the flag?
+- If you've found important code or vulnerabilities, focus on exploiting them
+- If you're repeating similar reconnaissance, move to exploitation phase
 
 If you're not making progress, consider:
 - Analyzing the exact logic in any code you've found
