@@ -23,7 +23,7 @@
                 <h2 class="text-xl font-semibold">New CTF Challenge</h2>
             </div>
             
-            <form id="challenge-form" class="space-y-4">
+            <form id="challenge-form" class="space-y-4" enctype="multipart/form-data">
                 <div>
                     <label for="url" class="block text-sm font-medium text-gray-700 mb-1">Challenge URL</label>
                     <input type="url" id="url" name="url" required 
@@ -61,6 +61,15 @@
                 </div>
 
                 <div>
+                    <label for="model" class="block text-sm font-medium text-gray-700 mb-1">Model</label>
+                    <select id="model" name="model"
+                            class="block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500">
+                        <option value="gpt-5-mini" selected>gpt-5-mini</option>
+                        <option value="gpt-5">gpt-5</option>
+                    </select>
+                </div>
+
+                <div>
                     <label for="description" class="block text-sm font-medium text-gray-700 mb-1">Description (optional)</label>
                     <textarea id="description" name="description" rows="3"
                               class="block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500"
@@ -71,6 +80,12 @@
                     <label for="timeout" class="block text-sm font-medium text-gray-700 mb-1">Timeout (seconds)</label>
                     <input type="number" id="timeout" name="timeout" min="60" max="1800" value="300"
                            class="block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500">
+                </div>
+
+                <div>
+                    <label for="handouts" class="block text-sm font-medium text-gray-700 mb-1">Handout Files (optional)</label>
+                    <input id="handouts" name="handouts" type="file" multiple class="block w-full text-sm text-gray-700" />
+                    <p class="text-xs text-gray-500 mt-1">These will be available at <code>/workspace/handouts</code> inside the container.</p>
                 </div>
 
                 <button type="submit" id="start-btn"
@@ -121,6 +136,21 @@
                 <div>
                     <span class="text-gray-500 text-sm">Flag Format:</span>
                     <div id="flag-format" class="font-mono text-sm bg-gray-100 p-2 rounded mt-1"></div>
+                </div>
+
+                <!-- Handout Upload UI -->
+                <div class="pt-2 border-t">
+                    <h4 class="text-md font-medium mb-2">Upload Handout Files</h4>
+                    <p class="text-sm text-gray-600 mb-2">Files will be available at <code>/workspace/handouts</code> inside the container.</p>
+                    <div class="flex items-center space-x-2">
+                        <input id="handout-input" type="file" multiple class="block w-full text-sm text-gray-700" />
+                        <button id="handout-upload-btn" class="bg-primary-600 hover:bg-primary-700 text-white text-sm font-medium py-2 px-3 rounded">Upload</button>
+                    </div>
+                    <div id="handout-upload-error" class="hidden mt-2 p-2 bg-red-50 border border-red-200 rounded text-sm text-red-700"></div>
+                    <div id="handout-list" class="mt-3 hidden">
+                        <div class="text-sm font-medium mb-1">Uploaded files:</div>
+                        <ul id="handout-files-ul" class="list-disc list-inside text-sm text-gray-700"></ul>
+                    </div>
                 </div>
 
                 <div id="flag-found" class="hidden p-4 bg-green-50 border border-green-200 rounded-lg">
@@ -224,6 +254,7 @@ function setupEventListeners() {
     document.getElementById('challenge-form').addEventListener('submit', handleFormSubmit);
     document.getElementById('stop-btn').addEventListener('click', stopChallenge);
     document.getElementById('delete-btn').addEventListener('click', deleteSession);
+    document.getElementById('handout-upload-btn').addEventListener('click', uploadHandouts);
 }
 
 async function checkApiHealth() {
@@ -240,14 +271,8 @@ async function checkApiHealth() {
 async function handleFormSubmit(event) {
     event.preventDefault();
     
-    const formData = new FormData(event.target);
-    const request = {
-        url: formData.get('url'),
-        flag_format: formData.get('flag_format'),
-        challenge_type: formData.get('challenge_type') || null,
-        description: formData.get('description') || null,
-        timeout: parseInt(formData.get('timeout'))
-    };
+    const formEl = event.target;
+    const formData = new FormData(formEl);
     
     try {
         setLoading(true);
@@ -255,8 +280,7 @@ async function handleFormSubmit(event) {
         
         const response = await fetch('/challenges/start', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(request)
+            body: formData
         });
         
         if (!response.ok) {
@@ -413,6 +437,22 @@ function updateSessionStatus(session) {
         document.getElementById('error-details').textContent = session.error_message;
         document.getElementById('error-info').classList.remove('hidden');
     }
+
+    // Update handout list
+    const listWrap = document.getElementById('handout-list');
+    const listEl = document.getElementById('handout-files-ul');
+    if (session.uploaded_files && session.uploaded_files.length > 0) {
+        listWrap.classList.remove('hidden');
+        listEl.innerHTML = '';
+        session.uploaded_files.forEach(name => {
+            const li = document.createElement('li');
+            li.textContent = `/workspace/handouts/${name}`;
+            listEl.appendChild(li);
+        });
+    } else {
+        listWrap.classList.add('hidden');
+        listEl.innerHTML = '';
+    }
 }
 
 function updateActionLog(actions) {
@@ -446,7 +486,8 @@ function addActionToLog(action) {
     
     const timestamp = new Date(action.timestamp).toLocaleTimeString();
     const icon = getActionIcon(action);
-    
+
+    // Build static HTML structure; inject dynamic content via textContent
     actionDiv.innerHTML = `
         <div class="flex items-start justify-between mb-2">
             <div class="flex items-center">
@@ -464,26 +505,22 @@ function addActionToLog(action) {
         </div>
         
         ${action.reasoning ? `
-            <div class="mb-2 p-2 bg-blue-50 rounded text-sm text-blue-800">
-                <strong>Reasoning:</strong> ${action.reasoning}
+            <div class=\"mb-2 p-2 bg-blue-50 rounded text-sm text-blue-800\">
+                <strong>Reasoning:</strong> <span class=\"js-reasoning\"></span>
             </div>
         ` : ''}
         
         ${action.command ? `
-            <div class="mb-2">
-                <div class="text-xs text-gray-500 mb-1">Command:</div>
-                <code class="bg-gray-900 text-green-400 px-2 py-1 rounded text-sm block">
-                    ${action.command}
-                </code>
+            <div class=\"mb-2\">
+                <div class=\"text-xs text-gray-500 mb-1\">Command:</div>
+                <code class=\"js-command bg-gray-900 text-green-400 px-2 py-1 rounded text-sm block\"></code>
             </div>
         ` : ''}
         
         ${action.output ? `
             <div>
-                <div class="text-xs text-gray-500 mb-1">Output:</div>
-                <pre class="terminal text-xs max-h-32 overflow-y-auto whitespace-pre-wrap p-2 rounded">
-                    ${action.output}
-                </pre>
+                <div class=\"text-xs text-gray-500 mb-1\">Output:</div>
+                <pre class=\"js-output terminal text-xs max-h-32 overflow-y-auto whitespace-pre-wrap p-2 rounded\"></pre>
             </div>
         ` : ''}
         
@@ -495,6 +532,19 @@ function addActionToLog(action) {
     `;
     
     logContainer.appendChild(actionDiv);
+    // Safely inject dynamic text
+    if (action.reasoning) {
+        const r = actionDiv.querySelector('.js-reasoning');
+        if (r) r.textContent = String(action.reasoning);
+    }
+    if (action.command) {
+        const c = actionDiv.querySelector('.js-command');
+        if (c) c.textContent = String(action.command);
+    }
+    if (action.output) {
+        const o = actionDiv.querySelector('.js-output');
+        if (o) o.textContent = String(action.output);
+    }
     logContainer.scrollTop = logContainer.scrollHeight;
 }
 
@@ -602,5 +652,39 @@ function showError(message) {
 
 function hideError() {
     document.getElementById('error-alert').classList.add('hidden');
+}
+
+async function uploadHandouts() {
+    if (!currentSession) {
+        showError('Start a session before uploading handouts.');
+        return;
+    }
+    const input = document.getElementById('handout-input');
+    const files = input.files;
+    const errEl = document.getElementById('handout-upload-error');
+    errEl.classList.add('hidden');
+    errEl.textContent = '';
+    if (!files || files.length === 0) {
+        return;
+    }
+    try {
+        for (let i = 0; i < files.length; i++) {
+            const fd = new FormData();
+            fd.append('file', files[i]);
+            const res = await fetch(`/challenges/${currentSession.session_id}/upload`, {
+                method: 'POST',
+                body: fd
+            });
+            if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                throw new Error(data.detail || 'Failed to upload file');
+            }
+        }
+        await fetchSessionStatus(currentSession.session_id);
+        input.value = '';
+    } catch (e) {
+        errEl.textContent = e.message || 'Failed to upload file(s)';
+        errEl.classList.remove('hidden');
+    }
 }
 {% endblock %}

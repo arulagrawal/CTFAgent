@@ -53,13 +53,13 @@ RUN pip3 install --no-cache-dir \
     angr \
     capstone 
 
-# Install additional tools via pip
-RUN pip3 install --no-cache-dir \
-    flask django \
-    selenium \
-    scrapy \
-    base58 \
-    qrcode
+# # Install additional tools via pip
+# RUN pip3 install --no-cache-dir \
+#     flask django \
+#     selenium \
+#     scrapy \
+#     base58 \
+#     qrcode
 
 # Install Node.js packages
 RUN npm install -g \
@@ -84,10 +84,6 @@ RUN useradd -m -s /bin/bash ctfuser && \
 # Set up environment
 ENV PATH="/opt/ghidra:${PATH}"
 ENV GHIDRA_INSTALL_DIR="/opt/ghidra"
-
-# Copy useful scripts
-COPY scripts/ /usr/local/bin/
-RUN chmod +x /usr/local/bin/*
 
 # Switch to non-root user
 USER ctfuser

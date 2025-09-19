@@ -2,8 +2,10 @@ import docker
 import asyncio
 import logging
 from typing import Optional, Dict, Any
+from docker.models.containers import Container
 import json
 import uuid
+from pprint import pprint
 
 logger = logging.getLogger(__name__)
 
@@ -11,7 +13,7 @@ logger = logging.getLogger(__name__)
 class DockerManager:
     def __init__(self):
         self.client = docker.from_env()
-        self.containers: Dict[str, docker.models.containers.Container] = {}
+        self.containers: Dict[str, Container] = {}
 
     async def create_container(self, session_id: str, image: str = "ctf-agent:latest") -> str:
         """Create a new Docker container for CTF challenge solving."""
@@ -105,15 +107,17 @@ class DockerManager:
                 demux=True,
                 workdir="/workspace"
             )
+
+            pprint(exec_result)
             
             stdout = exec_result.output[0].decode('utf-8') if exec_result.output[0] else ""
             stderr = exec_result.output[1].decode('utf-8') if exec_result.output[1] else ""
             
             logger.info(f"Command completed with exit code {exec_result.exit_code}")
-            if stdout:
-                logger.debug(f"STDOUT: {stdout[:200]}...")
-            if stderr:
-                logger.debug(f"STDERR: {stderr[:200]}...")
+            # if stdout:
+            logger.debug(f"STDOUT: {stdout[:200]}...")
+            # if stderr:
+            logger.debug(f"STDERR: {stderr[:200]}...")
             
             return {
                 "exit_code": exec_result.exit_code,
@@ -162,6 +166,42 @@ class DockerManager:
             
         except Exception as e:
             logger.error(f"Failed to copy file to container {session_id}: {e}")
+            return False
+
+    async def copy_local_file_to_container(self, session_id: str, host_path: str, container_dest_path: str) -> bool:
+        """Copy a local host file into the container exactly (binary-safe)."""
+        if session_id not in self.containers:
+            raise ValueError(f"No container found for session {session_id}")
+
+        import os
+        import tarfile
+        import io
+
+        container = self.containers[session_id]
+        try:
+            # Ensure destination directory exists in container
+            dest_dir = container_dest_path.rsplit('/', 1)[0] or '/'
+            try:
+                container.exec_run(['/bin/bash', '-c', f"mkdir -p '{dest_dir}'"], stdout=False, stderr=False)
+            except Exception:
+                pass
+
+            # Create tar archive containing the file with the correct filename
+            tar_stream = io.BytesIO()
+            with tarfile.open(fileobj=tar_stream, mode='w') as tar:
+                with open(host_path, 'rb') as f:
+                    data = f.read()
+                arcname = container_dest_path.split('/')[-1]
+                tarinfo = tarfile.TarInfo(name=arcname)
+                tarinfo.size = len(data)
+                tar.addfile(tarinfo, io.BytesIO(data))
+            tar_stream.seek(0)
+
+            # Put archive into destination directory
+            container.put_archive(path=dest_dir, data=tar_stream.read())
+            return True
+        except Exception as e:
+            logger.error(f"Failed to copy local file '{host_path}' to container {session_id} at '{container_dest_path}': {e}")
             return False
 
     async def cleanup_container(self, session_id: str):

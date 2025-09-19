@@ -3,8 +3,8 @@ import logging
 import re
 import json
 from typing import List, Dict, Any, Optional, Callable
+import os
 from datetime import datetime, timezone
-import openai
 from openai import AsyncOpenAI
 
 from .models import AgentAction, ChallengeType
@@ -18,6 +18,26 @@ class CTFAgent:
         self.client = AsyncOpenAI(api_key=openai_api_key)
         self.model = model  # Using gpt-5-mini (the latest GPT-5 small model)
         self.docker_manager = DockerManager()
+        self._ensured_handout_dir: Dict[str, bool] = {}
+        self._session_handouts: Dict[str, List[str]] = {}
+
+    async def ensure_handout_dir(self, session_id: str) -> None:
+        """Ensure /workspace/handouts exists inside the container."""
+        try:
+            await self.docker_manager.execute_command(session_id, "mkdir -p /workspace/handouts")
+            self._ensured_handout_dir[session_id] = True
+        except Exception:
+            pass
+
+    async def copy_host_file_to_container(self, session_id: str, host_path: str, container_path: str) -> bool:
+        """Copy a previously saved host file into the container at container_path (binary-safe)."""
+        await self.ensure_handout_dir(session_id)
+        return await self.docker_manager.copy_local_file_to_container(session_id, host_path, container_path)
+
+    def note_uploaded_file(self, session_id: str, filename: str) -> None:
+        files = self._session_handouts.setdefault(session_id, [])
+        if filename not in files:
+            files.append(filename)
     
     def _detect_challenge_type(self, url: str) -> Optional[str]:
         """Attempt to detect challenge type from URL patterns."""
@@ -62,7 +82,7 @@ class CTFAgent:
             
             container = self.docker_manager.containers[session_id]
             container.reload()  # Refresh container state
-            
+           
             status_info = []
             status_info.append(f"Status: {container.status}")
             status_info.append(f"State: {container.attrs['State']['Status']}")
@@ -94,6 +114,8 @@ class CTFAgent:
         challenge_url: str,
         flag_format: str,
         challenge_type: Optional[ChallengeType] = None,
+        description: Optional[str] = None,
+        uploaded_files: Optional[List[str]] = None,
         callback: Optional[Callable] = None
     ) -> List[AgentAction]:
         """Main method to solve a CTF challenge."""
@@ -102,6 +124,22 @@ class CTFAgent:
         try:
             # Create container
             await self.docker_manager.create_container(session_id)
+            # Ensure handouts dir exists
+            await self.ensure_handout_dir(session_id)
+            # Initialize session handouts
+            self._session_handouts[session_id] = list(uploaded_files or [])
+            # Copy any pre-uploaded handouts into container now that it exists
+            if self._session_handouts[session_id]:
+                base_dir = os.path.join("data", "handouts", session_id)
+                for name in self._session_handouts[session_id]:
+                    host_path = os.path.join(base_dir, name)
+                    dest_path = f"/workspace/handouts/{name}"
+                    try:
+                        ok = await self.copy_host_file_to_container(session_id, host_path, dest_path)
+                        if not ok:
+                            logger.warning(f"Failed to copy pre-uploaded handout {name} to container for session {session_id}")
+                    except Exception as e:
+                        logger.warning(f"Error copying pre-uploaded handout {name}: {e}")
             
             # Send initial status update
             if callback:
@@ -116,7 +154,13 @@ class CTFAgent:
                 await callback("action", init_action.dict())
             
             # Start with challenge analysis - let AI decide what tools it needs
-            analysis_prompt = self._build_analysis_prompt(challenge_url, flag_format, challenge_type)
+            analysis_prompt = self._build_analysis_prompt(
+                challenge_url,
+                flag_format,
+                challenge_type,
+                description,
+                self._session_handouts.get(session_id, [])
+            )
             analysis_actions = await self._execute_with_ai(
                 session_id,
                 analysis_prompt,
@@ -125,8 +169,8 @@ class CTFAgent:
             )
             actions.extend(analysis_actions)
             
-            # Iterative solving process
-            max_iterations = 10
+            # Iterative solving process (strict one-by-one)
+            max_iterations = 20
             for i in range(max_iterations):
                 # Check if flag found
                 flag = self._check_for_flag(actions, flag_format)
@@ -143,8 +187,13 @@ class CTFAgent:
                         await callback("flag_found", flag_action.dict())
                     break
                 
-                # Get next action from AI
-                next_prompt = self._build_iteration_prompt(actions, flag_format, i)
+                # Get next single action from AI
+                next_prompt = self._build_iteration_prompt(
+                    actions,
+                    flag_format,
+                    i,
+                    self._session_handouts.get(session_id, [])
+                )
                 iteration_actions = await self._execute_with_ai(
                     session_id,
                     next_prompt,
@@ -156,28 +205,8 @@ class CTFAgent:
                 # Add a small delay between iterations to ensure frontend updates
                 await asyncio.sleep(1)
                 
-                # Detect if AI is repeating commands (loop detection)
-                recent_commands = [action.command for action in actions[-6:] if action.command]
-                if len(recent_commands) >= 4:
-                    # Check if we're repeating similar commands
-                    command_similarity = sum(1 for cmd1 in recent_commands[-2:] for cmd2 in recent_commands[-4:-2] 
-                                           if cmd1 and cmd2 and (cmd1 == cmd2 or cmd1.split()[0] == cmd2.split()[0]))
-                    if command_similarity >= 2:
-                        logger.warning(f"Detected potential command repetition. Similarity score: {command_similarity}")
-                        # Add a hint to break the loop
-                        loop_hint_action = AgentAction(
-                            timestamp=datetime.now(timezone.utc),
-                            action_type="system_hint",
-                            output="SYSTEM HINT: You may be repeating similar commands. Try a completely different approach or tool. Focus on exploiting any discovered vulnerabilities rather than more reconnaissance.",
-                            reasoning="Loop detection triggered",
-                            success=True
-                        )
-                        actions.append(loop_hint_action)
-                        if callback:
-                            await callback("action", loop_hint_action.dict())
-                
                 # Prevent infinite loops
-                if not iteration_actions or all(not action.success for action in iteration_actions[-3:]):
+                if not iteration_actions:
                     break
             
             return actions
@@ -206,43 +235,95 @@ class CTFAgent:
         actions = []
         
         try:
-            # Build conversation history for better context
-            messages = [{"role": "system", "content": self._get_system_prompt()}]
-            
-            # Add some recent context if available
+            # Build consolidated input for Responses API (single-step)
+            context_blocks = []
             if len(previous_actions) > 0:
                 recent_context = "Previous session context:\n"
-                for action in previous_actions[-3:]:  # Last 3 actions for context
+                for action in previous_actions:
                     if action.command:
                         recent_context += f"Executed: {action.command}\n"
                         if action.output and len(action.output.strip()) > 0:
-                            output_preview = action.output[:200] + "..." if len(action.output) > 200 else action.output
-                            recent_context += f"Result: {output_preview}\n"
-                
-                messages.append({"role": "assistant", "content": recent_context})
-            
-            messages.append({"role": "user", "content": prompt})
-            
-            # Get AI response with GPT-5 parameters
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_completion_tokens=10000,  # Further increased to prevent truncation
-                reasoning_effort="medium"  # Reduced reasoning effort to save tokens for response
-            )
-            
-            ai_response = response.choices[0].message.content
+                            # Extract and include FULL STDOUT (not truncated)
+                            stdout_match = re.search(r'STDOUT:\n(.*?)(?:\n\nSTDERR:|$)', action.output, re.DOTALL)
+                            if stdout_match:
+                                stdout_content = stdout_match.group(1)
+                                recent_context += f"STDOUT (full):\n{stdout_content}\n"
+                            else:
+                                # Fallback: include full recorded output
+                                recent_context += f"Output (full):\n{action.output}\n"
+                context_blocks.append(recent_context)
 
-            logger.info(f"AI Response: {response}")
-            logger.debug(f"AI Response Content: {repr(ai_response)}")
-            
-            # Check if response is empty or None
+            user_block = f"User request:\n{prompt}"
+            input_text = "\n\n".join(context_blocks + [user_block]) if context_blocks else user_block
+
+            # Call Responses API with JSON schema for a single command, fallback to chat.completions if needed
+            try:
+                response = await self.client.responses.create(
+                    model=self.model,
+                    system=self._get_system_prompt(),
+                    input=input_text,
+                    max_output_tokens=10000,
+                    reasoning={"effort": "medium"},
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "SingleCommand",
+                            "strict": True,
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "command": {"type": "string"},
+                                    "reasoning": {"type": "string"}
+                                },
+                                "required": ["command"],
+                                "additionalProperties": False
+                            }
+                        }
+                    }
+                )
+                use_responses_api = True
+            except Exception as e:
+                logger.warning(f"Responses API call failed, falling back to chat.completions: {e}")
+                messages = [
+                    {"role": "system", "content": self._get_system_prompt()},
+                    {"role": "user", "content": input_text}
+                ]
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    max_completion_tokens=4000,
+                    reasoning_effort="medium"
+                )
+                use_responses_api = False
+
+            # Extract output text
+            if use_responses_api:
+                ai_response = getattr(response, "output_text", None)
+                if ai_response is None:
+                    try:
+                        parts: List[str] = []
+                        for out in getattr(response, "output", []) or []:
+                            for content in getattr(out, "content", []) or []:
+                                if getattr(content, "type", None) in ("output_text", "text") and getattr(content, "text", None):
+                                    parts.append(content.text)
+                        ai_response = "\n".join(parts)
+                    except Exception:
+                        ai_response = ""
+            else:
+                try:
+                    ai_response = response.choices[0].message.content
+                except Exception:
+                    ai_response = ""
+
+            logger.info(f"AI Responses output length: {len(ai_response or '')}")
+            logger.debug(f"AI Response Content: {repr((ai_response or '')[:1000])}")
+
             if not ai_response or ai_response.strip() == "":
-                logger.warning("AI returned empty response, likely due to token limits")
+                logger.warning("AI returned empty response from Responses API")
                 error_action = AgentAction(
                     timestamp=datetime.now(timezone.utc),
                     action_type="ai_empty_response",
-                    output=f"AI returned empty response. Finish reason: {response.choices[0].finish_reason}. Usage: {response.usage}",
+                    output="AI returned empty response using Responses API",
                     reasoning="AI hit token limits or returned empty content",
                     success=False
                 )
@@ -251,20 +332,17 @@ class CTFAgent:
                     await callback("action", error_action.dict())
                 return actions
             
-            # Check if response was truncated due to length limits
-            if response.choices[0].finish_reason == 'length':
-                logger.warning(f"AI response was truncated due to length limits. Response: {repr(ai_response[-100:])}")
-                # Try to fix common truncation issues
-                if not ai_response.rstrip().endswith((']', '}')):
-                    logger.info("Attempting to fix truncated JSON response")
-                    # If it looks like JSON was cut off, try to complete it
-                    if ai_response.count('[') > ai_response.count(']'):
-                        ai_response += ']'
-                    if ai_response.count('{') > ai_response.count('}'):
-                        ai_response += '}'
-            
-            # Parse AI response for commands
-            commands = self._parse_ai_response(ai_response)
+            # Parse AI response for a single command (prefer strict JSON)
+            try:
+                parsed = json.loads(ai_response)
+                commands = []
+                if isinstance(parsed, dict) and parsed.get("command"):
+                    commands = [{
+                        "command": str(parsed.get("command", "")).strip(),
+                        "reasoning": str(parsed.get("reasoning", "")).strip() or "No reasoning provided"
+                    }]
+            except Exception:
+                commands = self._parse_ai_response(ai_response)
             
             # If no commands were parsed, log the full AI response for debugging
             if not commands:
@@ -283,32 +361,63 @@ class CTFAgent:
                     await callback("action", error_action.dict())
                 
                 # Try a follow-up request with more explicit instructions  
-                followup_prompt = f"""The previous response didn't contain extractable commands. Please provide specific shell commands in this exact JSON format:
+                followup_prompt = f"""The previous response didn't contain an extractable command. Provide a SINGLE shell command as a JSON object (no prose), matching this schema:
 
-[
-    {{
-        "command": "curl -v {prompt.split('Target: ')[1].split()[0] if 'Target: ' in prompt else 'TARGET_URL'}",
-        "reasoning": "Initial reconnaissance of the target"
-    }}
-]
-
-Provide 1-3 concrete shell commands to start analyzing the challenge. Use the actual target URL, not placeholders."""
+{{
+  "command": "curl -sSL {prompt.split('Target: ')[1].split()[0] if 'Target: ' in prompt else 'TARGET_URL'}",
+  "reasoning": "Initial reconnaissance"
+}}
+"""
                 
                 try:
-                    followup_response = await self.client.chat.completions.create(
-                        model=self.model,
-                        messages=[
-                            {"role": "system", "content": "You are a CTF expert. Provide shell commands in JSON format only."},
-                            {"role": "user", "content": followup_prompt}
-                        ],
-                        max_completion_tokens=500,
-                        reasoning_effort="medium"
-                    )
-                    
-                    followup_commands = self._parse_ai_response(followup_response.choices[0].message.content)
-                    if followup_commands:
-                        logger.info(f"Extracted {len(followup_commands)} commands from followup request")
-                        commands = followup_commands
+                    try:
+                        followup_response = await self.client.responses.create(
+                            model=self.model,
+                            system="You are a CTF expert. Provide a SINGLE shell command in JSON object format only.",
+                            input=followup_prompt,
+                            max_output_tokens=500,
+                            reasoning={"effort": "medium"},
+                            response_format={
+                                "type": "json_schema",
+                                "json_schema": {
+                                    "name": "SingleCommand",
+                                    "strict": True,
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "command": {"type": "string"},
+                                            "reasoning": {"type": "string"}
+                                        },
+                                        "required": ["command"],
+                                        "additionalProperties": False
+                                    }
+                                }
+                            }
+                        )
+                        followup_text = getattr(followup_response, "output_text", "") or ""
+                    except Exception as e2:
+                        logger.warning(f"Responses API follow-up failed, falling back: {e2}")
+                        followup_cc = await self.client.chat.completions.create(
+                            model=self.model,
+                            messages=[
+                                {"role": "system", "content": "You are a CTF expert. Provide a SINGLE shell command in JSON object format only."},
+                                {"role": "user", "content": followup_prompt}
+                            ],
+                            max_completion_tokens=500,
+                            reasoning_effort="medium"
+                        )
+                        followup_text = followup_cc.choices[0].message.content
+                    try:
+                        parsed_fu = json.loads(followup_text)
+                        if isinstance(parsed_fu, dict) and parsed_fu.get("command"):
+                            commands = [{
+                                "command": str(parsed_fu.get("command", "")).strip(),
+                                "reasoning": str(parsed_fu.get("reasoning", "")).strip() or "No reasoning provided"
+                            }]
+                    except Exception:
+                        commands = self._parse_ai_response(followup_text)[:1]
+                    if commands:
+                        logger.info("Extracted a single command from followup request")
                     else:
                         logger.error("Followup request also failed to produce commands")
                         return actions
@@ -317,16 +426,17 @@ Provide 1-3 concrete shell commands to start analyzing the challenge. Use the ac
                     logger.error(f"Followup request failed: {followup_error}")
                     return actions
             
-            for command_data in commands:
+            # Execute only one command per step
+            for command_data in commands[:1]:
                 command = command_data.get("command", "")
                 reasoning = command_data.get("reasoning", "")
                 
                 if not command or not command.strip():
                     continue
                 
-                # Validate command doesn't contain JSON artifacts
-                if any(artifact in command for artifact in ['"command":', '"reasoning":', '{"', '"}', '["', '"]']):
-                    logger.warning(f"Skipping malformed command with JSON artifacts: {command}")
+                # Validate command doesn't contain clear JSON key artifacts
+                if any(artifact in command for artifact in ['"command":', '"reasoning":']):
+                    logger.warning(f"Skipping malformed command that still includes JSON keys: {command}")
                     continue
                 
                 # Clean up any remaining quotes or artifacts (but preserve quotes inside the command)
@@ -341,22 +451,14 @@ Provide 1-3 concrete shell commands to start analyzing the challenge. Use the ac
                         command = command.replace('TARGET_IP', actual_url)
                         logger.info(f"Replaced placeholder with actual URL: {command}")
                 
-                # Fix common truncation issues with sed commands
-                if "sed -n '" in command and not command.endswith("'"):
-                    # Check if it ends with a pattern like '1,200p without closing quote
-                    import re
-                    sed_pattern = r"sed -n '(\d+,\d+p)$"
-                    match = re.search(sed_pattern, command)
-                    if match:
-                        command += "'"
-                        logger.info(f"Fixed truncated sed command: {command}")
-                
-                # Fix other common quote truncation patterns
-                if command.count("'") % 2 == 1:  # Odd number of single quotes
-                    # Common patterns where we can safely add closing quote
-                    if any(pattern in command for pattern in ["sed -n '", "awk '", "grep '"]):
-                        command += "'"
-                        logger.info(f"Fixed unmatched single quote: {command}")
+                # If command is reading a full file, encourage using cat (less confusion on output)
+                if re.search(r"sed\s+-n\s+'1,\d+p'\s+\S+", command):
+                    # Replace with cat for clarity
+                    file_match = re.search(r"sed\s+-n\s+'1,\d+p'\s+(\S+)", command)
+                    if file_match:
+                        file_path = file_match.group(1)
+                        command = f"cat {file_path}"
+                        logger.info(f"Rewrote sed full-file read to cat: {command}")
                 
                 if not command or len(command.strip()) == 0:
                     continue
@@ -403,7 +505,7 @@ Provide 1-3 concrete shell commands to start analyzing the challenge. Use the ac
                 
                 if callback:
                     await callback("action", action.dict())
-                
+
                 # Small delay to prevent overwhelming
                 await asyncio.sleep(0.5)
         
@@ -417,244 +519,90 @@ Provide 1-3 concrete shell commands to start analyzing the challenge. Use the ac
             )
             actions.append(error_action)
             if callback:
-                await callback("error", error_action.dict())
+                # Emit as action to avoid front-end error banner for non-fatal AI issues
+                await callback("action", error_action.dict())
         
         return actions
 
     def _get_system_prompt(self) -> str:
         """Get the system prompt for the AI agent."""
-        return """You are an expert CTF (Capture The Flag) challenge solving agent with deep knowledge of cybersecurity. Your goal is to analyze and solve various types of challenges by thinking strategically and adapting your approach.
+        return """You are an expert CTF challenge solver. Analyze the target and find the flag.
 
-AVAILABLE TOOLS IN CONTAINER:
-• Web Analysis: curl, wget, python with requests library
-• Cryptography: openssl, hashcat, john, python crypto libraries, sage
-• Reverse Engineering: gdb, radare2, ghidra, binutils, objdump, strings
-• Forensics: binwalk, foremost, strings, hexdump, file, exiftool
-• Network: nmap, netcat, telnet, wireshark, tcpdump
-• Programming: python3, nodejs, gcc, make
-• Steganography: steghide, stegsolve
-• General: vim, grep, find, awk, sed, base64, xxd
+TOOLS AVAILABLE:
+ curl, wget, python3, cat, nmap, grep, strings, base64, openssl, hashcat, john, binwalk, steghide, and many others.
 
-DIAGNOSTIC COMMANDS:
-• Check tool availability: "which curl && curl --version"
-• Test network connectivity: "ping -c 1 8.8.8.8"
-• Check workspace: "pwd && ls -la"
-• Environment check: "env | grep -E '(HTTP|PROXY)'"
+IMPORTANT:
+• Use /workspace for temporary files (not /tmp)
+• Commands with pipes/redirects are automatically wrapped in bash
+• Use actual URLs, not placeholders like TARGET_URL
 
-IMPORTANT NOTES:
-• Use /workspace directory for temporary files instead of /tmp (e.g., -o /workspace/file.html)
-• The /tmp directory has noexec restrictions
-• All commands with &&, ||, |, >, < are automatically wrapped in bash shell
-• Working directory is always /workspace
+WEB CHALLENGE STRATEGY (one step at a time):
+At each turn, propose exactly ONE shell command with a short reasoning.
+If a handout exists, use it to understand the app, BUT the real interaction must target the provided URL (e.g., curl the site). Alternate between reading handout and interacting with the live site. If any handout file is an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted using tar/unzip/7z; do not re-extract if already extracted. Prefer: curl -sSL (and -c/-b cookies when needed). Use actual URLs, no placeholders.
 
 RESPONSE FORMAT:
-CRITICAL: Always respond with ONLY a valid JSON array. No other text. Use ACTUAL URLs provided in the challenge, not placeholders like TARGET_URL. Example:
+Respond with ONLY a single JSON object with fields {command, reasoning}:
 
-[
-    {
-        "command": "curl -I https://actual-challenge-url.com",
-        "reasoning": "Check HTTP headers for server information"
-    },
-    {
-        "command": "curl -s https://actual-challenge-url.com | grep -i flag",
-        "reasoning": "Search page content for flag pattern"
-    }
-]
+{
+  "command": "curl -sSL https://actual-url.com",
+  "reasoning": "Initial reconnaissance"
+}
 
-IMPORTANT: Replace placeholder URLs with the actual challenge URL. DO NOT use TARGET_URL, TARGET_IP, or similar placeholders.
-DO NOT include any explanatory text before or after the JSON. ONLY the JSON array.
+No other text. Just the JSON object."""
 
-PROBLEM-SOLVING APPROACH:
-1. ANALYZE: First understand what type of challenge this is
-2. RECONNAISSANCE: Gather information about the target
-3. HYPOTHESIS: Form theories about potential vulnerabilities or solutions
-4. TEST: Execute targeted commands to test your hypotheses
-5. ADAPT: Based on results, refine your approach
-6. EXPLOIT: When you find a weakness, exploit it systematically
-7. EXTRACT: Look for flags in all outputs using the provided pattern
-
-CHALLENGE TYPES & STRATEGIES:
-• Web: Check source, headers, directories, parameters, cookies, forms, SQL injection, XSS
-• Crypto: Analyze ciphers, keys, encoding, hashing, frequency analysis, known attacks
-• Reverse: Disassemble, analyze strings, debug, understand program flow
-• Forensics: File analysis, metadata, hidden data, memory dumps, network captures
-• Steganography: Hidden messages in images, audio, text
-• Network: Port scans, protocol analysis, packet inspection
-• Misc: Think outside the box, combine multiple techniques
-
-IMPORTANT RULES:
-• Be methodical but efficient - don't waste time on unlikely paths
-• Always explain your reasoning clearly
-• If one approach fails, try a different angle
-• Look for flags in ALL command outputs, not just final results
-• Use appropriate tools for each challenge type
-• Build on previous findings - each command should advance your understanding
-• When stuck, step back and reconsider the challenge from a different perspective"""
-
-    def _build_analysis_prompt(self, url: str, flag_format: str, challenge_type: Optional[ChallengeType]) -> str:
+    def _build_analysis_prompt(self, url: str, flag_format: str, challenge_type: Optional[ChallengeType], description: Optional[str], uploaded_files: List[str]) -> str:
         """Build initial analysis prompt."""
-        # Auto-detect challenge type if not provided
-        detected_type = self._detect_challenge_type(url)
-        
-        if challenge_type:
-            type_hint = f" (Specified as: {challenge_type.value} challenge)"
-        elif detected_type:
-            type_hint = f" (Auto-detected as likely: {detected_type} challenge)"
-        else:
-            type_hint = " (Challenge type unknown - analyze to determine)"
-        
-        return f"""CHALLENGE ANALYSIS TASK:
+        desc = (description or "").strip()
+        desc_block = f"Description: {desc}\n\n" if desc else ""
+        handout_hint = "All uploaded handout files are available under /workspace/handouts.\n" \
+            "Use appropriate tools (tar, unzip, strings, file, binwalk) to inspect them.\n" \
+            "If any handout appears to be an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted (e.g., mkdir -p /workspace/handouts/extracted && cd /workspace/handouts/extracted && tar -xvf ../file.tar.gz || unzip -o ../file.zip). Avoid re-extracting if the directory already exists.\n\n" \
+            "When a URL is provided, always prioritize interacting with the live site to retrieve the real flag; use handouts only to inform your next live request."
+        files_block = ""
+        if uploaded_files:
+            files_list = "\n".join(f"- /workspace/handouts/{name}" for name in uploaded_files)
+            files_block = f"Handout files:\n{files_list}\n\n"
+        return f"""Target: {url}
+Flag format: {flag_format}
+{desc_block}
+{files_block}{handout_hint}Start analyzing this challenge to find the flag. Propose exactly ONE command as a JSON object (keys: command, reasoning)."""
 
-Target: {url}
-Flag Pattern: {flag_format}{type_hint}
-
-Your mission is to analyze this target and determine the best approach to find the flag. 
-
-INITIAL ANALYSIS:
-You need to understand what type of challenge this is and what approach to take. Consider:
-
-1. CHALLENGE TYPE ANALYSIS:
-   - Look at the URL structure and any hints
-   - What does the initial response tell you?
-   - What type of challenge does this appear to be?
-
-2. RECONNAISSANCE STRATEGY:
-   - What information do you need to gather first?
-   - What tools are most appropriate for this type of challenge?
-   - How can you efficiently explore the attack surface?
-
-3. GOAL ORIENTATION:
-   - Remember you're looking for: {flag_format}
-   - Where might such a flag typically be hidden?
-   - What vulnerabilities or techniques might reveal it?
-
-Start with commands that will help you understand the challenge type and gather initial intelligence. Be strategic - each command should give you valuable information to guide your next steps.
-
-Provide your first set of reconnaissance commands with clear reasoning for each."""
-
-    def _build_iteration_prompt(self, actions: List[AgentAction], flag_format: str, iteration: int) -> str:
+    def _build_iteration_prompt(self, actions: List[AgentAction], flag_format: str, iteration: int, uploaded_files: List[str]) -> str:
         """Build prompt for iterative solving."""
         import re  # For regex operations
         
-        # Use more actions for context, but intelligently summarize
-        recent_actions = actions[-8:] if len(actions) > 8 else actions
-        all_commands = [action.command for action in actions if action.command]
+        # Give ALL history - no limits so GPT has complete context
+        recent_actions = actions
         
-        # Build context with more intelligent summarization
-        context = "PREVIOUS FINDINGS:\n"
-        key_findings = []
-        successful_commands = []
-        failed_commands = []
-        important_discoveries = []
-        
+        context = "Previous work:\n"
         for action in recent_actions:
-            if action.success:
-                successful_commands.append(f"✓ {action.command}")
-                if action.output and len(action.output.strip()) > 0:
-                    # Extract STDOUT content for analysis
+            if action.command:
+                context += f"• {action.command}\n"
+                if action.output:
+                    # Extract STDOUT content
                     stdout_match = re.search(r'STDOUT:\n(.*?)(?:\n\nSTDERR:|$)', action.output, re.DOTALL)
                     if stdout_match:
                         stdout_content = stdout_match.group(1).strip()
-                        if stdout_content:
-                            # Check if this is an important discovery
-                            is_important = any(keyword in stdout_content.lower() for keyword in [
-                                'password', 'flag', 'error', 'code:', '$_get', '$_post', 'php', 'sql', 
-                                'admin', 'login', 'token', 'key', 'secret', 'hash', 'md5', 'sha', 
-                                'injection', 'xss', 'csrf', 'directory', 'file', 'path', 'include'
-                            ])
-                            
-                            # Provide more context for important findings, less for routine output
+                        if stdout_content and len(stdout_content) > 0:
+                            # Keep more output for better context
                             if len(stdout_content) > 500:
-                                # For long output, provide first 400 chars and last 100 chars
-                                output_preview = stdout_content[:400] + "\n...[truncated]...\n" + stdout_content[-100:]
+                                output_preview = stdout_content[:500] + "..."
                             else:
                                 output_preview = stdout_content
-                            
-                            if is_important:
-                                important_discoveries.append(f"IMPORTANT - From '{action.command}':\n{output_preview}")
-                            else:
-                                key_findings.append(f"From '{action.command}':\n{output_preview}")
-                    else:
-                        # Fallback to original truncation
-                        output_preview = action.output[:300] + "..." if len(action.output) > 300 else action.output
-                        key_findings.append(f"From '{action.command}': {output_preview}")
-            else:
-                failed_commands.append(f"✗ {action.command}")
+                            context += f"  → {output_preview}\n"
+                    elif not action.success:
+                        context += f"  → Failed\n"
+                context += "\n"
         
-        # Prioritize important discoveries
-        if important_discoveries:
-            context += "\nIMPORTANT DISCOVERIES:\n" + "\n".join(important_discoveries[-2:]) + "\n"
-        
-        context += "\nSuccessful commands:\n" + "\n".join(successful_commands[-4:]) + "\n"
-        if failed_commands:
-            context += "\nFailed commands:\n" + "\n".join(failed_commands[-3:]) + "\n"
-        
-        if key_findings:
-            context += "\nOther findings:\n" + "\n".join(key_findings[-2:]) + "\n"
-        
-        # Add command history to prevent repetition
-        if len(all_commands) > 0:
-            context += f"\nCOMMANDS ALREADY TRIED ({len(all_commands)} total):\n"
-            context += "\n".join([f"- {cmd}" for cmd in all_commands[-10:]])  # Show last 10 commands
-            context += "\n\nIMPORTANT: Do not repeat these exact commands. Try new approaches or variations.\n"
-        
-        # Determine what phase we're in
-        if iteration == 0:
-            phase = "RECONNAISSANCE"
-            guidance = "You should be gathering initial information about the target."
-        elif iteration < 3:
-            phase = "ANALYSIS"
-            guidance = "You should be analyzing the information you've gathered and forming hypotheses."
-        elif iteration < 7:
-            phase = "EXPLOITATION"
-            guidance = "You should be testing specific vulnerabilities or attack vectors."
-        else:
-            phase = "DEEP INVESTIGATION"
-            guidance = "Try alternative approaches or look deeper into previous findings."
-        
-        return f"""ITERATION {iteration + 1}/10 - PHASE: {phase}
+        files_block = ""
+        if uploaded_files:
+            files_list = "\n".join(f"- /workspace/handouts/{name}" for name in uploaded_files)
+            files_block = f"Available handout files (re-usable):\n{files_list}\n\n"
+        return f"""{context}
+Flag format: {flag_format}
 
-{context}
-
-TARGET FLAG PATTERN: {flag_format}
-
-CURRENT SITUATION:
-{guidance}
-
-ANALYSIS REQUIRED:
-Look carefully at the command outputs above. What do they reveal? Focus on the IMPORTANT DISCOVERIES section.
-
-NEXT ACTIONS:
-Based on your findings so far, what should you do next? Consider:
-1. What have you learned from the command outputs above?
-2. What vulnerabilities or attack vectors do the outputs suggest?
-3. If you found code or error messages, how can you exploit them?
-4. Do the outputs contain any parameters, URLs, or hints you should investigate?
-
-SPECIFIC GUIDANCE:
-- If you see PHP code with password checks, analyze the logic for bypasses
-- If you see error messages, look for information disclosure
-- If you see forms or parameters, test for injection vulnerabilities
-- If you see file paths or directories, explore them further
-
-AVOID REPETITION:
-- Review the "COMMANDS ALREADY TRIED" section above
-- Do NOT repeat the exact same commands
-- If you need to retry something, modify the approach (different parameters, tools, etc.)
-- If you're stuck, try a completely different angle or tool
-
-PROGRESS CHECK:
-- Iteration {iteration + 1}/10 - Are you making progress toward finding the flag?
-- If you've found important code or vulnerabilities, focus on exploiting them
-- If you're repeating similar reconnaissance, move to exploitation phase
-
-If you're not making progress, consider:
-- Analyzing the exact logic in any code you've found
-- Testing specific parameter values based on the code logic
-- Looking for type confusion or loose comparison vulnerabilities
-- Exploring any hints in error messages or comments
-
-Provide your next set of strategic commands."""
+{files_block}
+Continue working toward finding the flag. If handouts include an archive and it is not yet extracted, extract it FIRST into /workspace/handouts/extracted. Propose exactly ONE next shell command with a short reasoning. If you just read a local file, avoid reprinting it fully again; summarize and move on to the next investigative step (often a live request to the URL). Use actual URLs and include -sSL. Return only a single JSON object with keys command and reasoning."""
 
     def _parse_ai_response(self, response: str) -> List[Dict[str, str]]:
         """Parse AI response to extract commands with improved error handling."""
@@ -888,6 +836,8 @@ Provide your next set of strategic commands."""
         
         return json_text
 
+    # Auto-exploration removed for strict one-by-one flow
+
     def _check_for_flag(self, actions: List[AgentAction], flag_format: str) -> Optional[str]:
         """Check if flag has been found in any action outputs."""
         # Convert flag format to regex
@@ -906,9 +856,10 @@ Provide your next set of strategic commands."""
                     if stdout_content and not any(phrase in stdout_content.lower() for phrase in [
                         'flag format:', 'flag pattern:', 'target flag:', 'looking for:', 'searching for:'
                     ]):
-                        match = pattern.search(stdout_content)
-                        if match:
-                            return match.group(0)
+                        for match in pattern.finditer(stdout_content):
+                            candidate = match.group(0)
+                            if 'fake' not in candidate.lower():
+                                return candidate
                 else:
                     # Fallback: search full output but exclude command lines and metadata
                     lines = action.output.split('\n')
@@ -918,8 +869,9 @@ Provide your next set of strategic commands."""
                     if content and not any(phrase in content.lower() for phrase in [
                         'flag format:', 'flag pattern:', 'target flag:', 'looking for:', 'searching for:'
                     ]):
-                        match = pattern.search(content)
-                        if match:
-                            return match.group(0)
+                        for match in pattern.finditer(content):
+                            candidate = match.group(0)
+                            if 'fake' not in candidate.lower():
+                                return candidate
         
         return None
