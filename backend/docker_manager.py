@@ -4,6 +4,7 @@ import logging
 from typing import Optional, Dict, Any
 import json
 import uuid
+from pprint import pprint
 
 logger = logging.getLogger(__name__)
 
@@ -105,15 +106,17 @@ class DockerManager:
                 demux=True,
                 workdir="/workspace"
             )
+
+            pprint(exec_result)
             
             stdout = exec_result.output[0].decode('utf-8') if exec_result.output[0] else ""
             stderr = exec_result.output[1].decode('utf-8') if exec_result.output[1] else ""
             
             logger.info(f"Command completed with exit code {exec_result.exit_code}")
-            if stdout:
-                logger.debug(f"STDOUT: {stdout[:200]}...")
-            if stderr:
-                logger.debug(f"STDERR: {stderr[:200]}...")
+            # if stdout:
+            logger.debug(f"STDOUT: {stdout[:200]}...")
+            # if stderr:
+            logger.debug(f"STDERR: {stderr[:200]}...")
             
             return {
                 "exit_code": exec_result.exit_code,
