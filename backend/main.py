@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Dict, List
 import json
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -110,7 +110,15 @@ async def health_check():
 
 
 @app.post("/challenges/start")
-async def start_challenge(request: ChallengeRequest):
+async def start_challenge(
+    url: str = Form(...),
+    flag_format: str = Form("flag{.*}"),
+    challenge_type: str | None = Form(None),
+    description: str | None = Form(None),
+    timeout: int = Form(300),
+    model: str = Form("gpt-5-mini"),
+    handouts: List[UploadFile] | None = None
+):
     """Start a new CTF challenge solving session."""
     if not ai_agent:
         raise HTTPException(status_code=500, detail="AI agent not initialized")
@@ -120,19 +128,77 @@ async def start_challenge(request: ChallengeRequest):
     # Create session
     session = ChallengeSession(
         session_id=session_id,
-        challenge_url=str(request.url),
-        flag_format=request.flag_format,
+        challenge_url=str(url),
+        flag_format=flag_format,
+        found_flag=None,
         status=ChallengeStatus.PENDING,
         created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc)
+        updated_at=datetime.now(timezone.utc),
+        uploaded_files=[]
     )
     
     sessions[session_id] = session
     
+    # Save uploaded handouts (if any)
+    if handouts:
+        base_dir = os.path.join("data", "handouts", session_id)
+        os.makedirs(base_dir, exist_ok=True)
+        for file in handouts:
+            try:
+                content = await file.read()
+                safe_name = file.filename or f"upload_{uuid.uuid4().hex}"
+                dest_path = os.path.join(base_dir, safe_name)
+                with open(dest_path, "wb") as f:
+                    f.write(content)
+                session.uploaded_files.append(safe_name)
+            except Exception as e:
+                logger.error(f"Failed to save handout {file.filename}: {e}")
+
     # Start solving in background
-    asyncio.create_task(solve_challenge_background(session_id, request))
+    asyncio.create_task(solve_challenge_background_form(session_id, url, flag_format, challenge_type, description, timeout, model))
     
     return {"session_id": session_id, "status": "started"}
+
+
+@app.post("/challenges/{session_id}/upload")
+async def upload_handout(session_id: str, file: UploadFile = File(...)):
+    """Upload a handout file and make it available under /workspace/handouts inside the container."""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = sessions[session_id]
+
+    # Save to backend storage under data/handouts/{session_id}/
+    base_dir = os.path.join("data", "handouts", session_id)
+    os.makedirs(base_dir, exist_ok=True)
+    safe_name = file.filename or f"upload_{uuid.uuid4().hex}"
+    dest_path = os.path.join(base_dir, safe_name)
+    try:
+        content = await file.read()
+        with open(dest_path, "wb") as f:
+            f.write(content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
+
+    # Track file in session
+    if safe_name not in session.uploaded_files:
+        session.uploaded_files.append(safe_name)
+    session.updated_at = datetime.now(timezone.utc)
+
+    # If container is running, copy immediately
+    try:
+        if not ai_agent:
+            raise RuntimeError("AI agent not initialized")
+        await ai_agent.ensure_handout_dir(session_id)
+        ok = await ai_agent.copy_host_file_to_container(session_id, dest_path, f"/workspace/handouts/{safe_name}")
+        if not ok:
+            logger.warning(f"Failed to copy {safe_name} into container for session {session_id}")
+        else:
+            ai_agent.note_uploaded_file(session_id, safe_name)
+    except Exception as e:
+        logger.warning(f"Could not copy handout into container now: {e}")
+
+    return {"status": "uploaded", "filename": safe_name}
 
 
 @app.get("/challenges/{session_id}")
@@ -164,7 +230,8 @@ async def stop_challenge(session_id: str):
         # Clean up container
         if session.container_id:
             try:
-                await ai_agent.docker_manager.cleanup_container(session_id)
+                if ai_agent:
+                    await ai_agent.docker_manager.cleanup_container(session_id)
             except Exception as e:
                 logger.error(f"Failed to cleanup container for session {session_id}: {e}")
         
@@ -185,7 +252,8 @@ async def delete_challenge(session_id: str):
     session = sessions[session_id]
     if session.container_id:
         try:
-            await ai_agent.docker_manager.cleanup_container(session_id)
+            if ai_agent:
+                await ai_agent.docker_manager.cleanup_container(session_id)
         except Exception as e:
             logger.error(f"Failed to cleanup container for session {session_id}: {e}")
     
@@ -212,7 +280,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         websocket_manager.disconnect(session_id)
 
 
-async def solve_challenge_background(session_id: str, request: ChallengeRequest):
+async def solve_challenge_background_form(session_id: str, url: str, flag_format: str, challenge_type: str | None, description: str | None, timeout: int, model: str):
     """Background task to solve challenge."""
     session = sessions[session_id]
     session.status = ChallengeStatus.RUNNING
@@ -237,12 +305,39 @@ async def solve_challenge_background(session_id: str, request: ChallengeRequest)
     
     try:
         # Start solving
+        if not ai_agent:
+            raise RuntimeError("AI agent not initialized")
+
+        # Ensure any pre-uploaded handouts are copied into container before starting
+        if session.uploaded_files:
+            base_dir = os.path.join("data", "handouts", session_id)
+            try:
+                await ai_agent.ensure_handout_dir(session_id)
+            except Exception:
+                pass
+            for name in session.uploaded_files:
+                host_path = os.path.join(base_dir, name)
+                dest_path = f"/workspace/handouts/{name}"
+                try:
+                    ok = await ai_agent.copy_host_file_to_container(session_id, host_path, dest_path)
+                    if not ok:
+                        logger.warning(f"Pre-copy failed for {name} in session {session_id}")
+                except Exception as e:
+                    logger.warning(f"Error copying handout {name} before start: {e}")
+
+        # Update model per-session if frontend selected a specific model
+        try:
+            if model:
+                ai_agent.model = model
+        except Exception:
+            pass
         actions = await ai_agent.solve_challenge(
             session_id=session_id,
-            challenge_url=str(request.url),
-            flag_format=request.flag_format,
-            challenge_type=request.challenge_type,
-            description=request.description,
+            challenge_url=str(url),
+            flag_format=flag_format,
+            challenge_type=challenge_type,  # type: ignore[arg-type]
+            description=description,
+            uploaded_files=session.uploaded_files,
             callback=websocket_callback
         )
         
@@ -277,7 +372,8 @@ async def solve_challenge_background(session_id: str, request: ChallengeRequest)
     finally:
         # Clean up container
         try:
-            await ai_agent.docker_manager.cleanup_container(session_id)
+            if ai_agent:
+                await ai_agent.docker_manager.cleanup_container(session_id)
         except Exception as e:
             logger.error(f"Failed to cleanup container for session {session_id}: {e}")
 

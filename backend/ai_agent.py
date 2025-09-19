@@ -3,6 +3,7 @@ import logging
 import re
 import json
 from typing import List, Dict, Any, Optional, Callable
+import os
 from datetime import datetime, timezone
 from openai import AsyncOpenAI
 
@@ -17,6 +18,26 @@ class CTFAgent:
         self.client = AsyncOpenAI(api_key=openai_api_key)
         self.model = model  # Using gpt-5-mini (the latest GPT-5 small model)
         self.docker_manager = DockerManager()
+        self._ensured_handout_dir: Dict[str, bool] = {}
+        self._session_handouts: Dict[str, List[str]] = {}
+
+    async def ensure_handout_dir(self, session_id: str) -> None:
+        """Ensure /workspace/handouts exists inside the container."""
+        try:
+            await self.docker_manager.execute_command(session_id, "mkdir -p /workspace/handouts")
+            self._ensured_handout_dir[session_id] = True
+        except Exception:
+            pass
+
+    async def copy_host_file_to_container(self, session_id: str, host_path: str, container_path: str) -> bool:
+        """Copy a previously saved host file into the container at container_path (binary-safe)."""
+        await self.ensure_handout_dir(session_id)
+        return await self.docker_manager.copy_local_file_to_container(session_id, host_path, container_path)
+
+    def note_uploaded_file(self, session_id: str, filename: str) -> None:
+        files = self._session_handouts.setdefault(session_id, [])
+        if filename not in files:
+            files.append(filename)
     
     def _detect_challenge_type(self, url: str) -> Optional[str]:
         """Attempt to detect challenge type from URL patterns."""
@@ -94,6 +115,7 @@ class CTFAgent:
         flag_format: str,
         challenge_type: Optional[ChallengeType] = None,
         description: Optional[str] = None,
+        uploaded_files: Optional[List[str]] = None,
         callback: Optional[Callable] = None
     ) -> List[AgentAction]:
         """Main method to solve a CTF challenge."""
@@ -102,6 +124,22 @@ class CTFAgent:
         try:
             # Create container
             await self.docker_manager.create_container(session_id)
+            # Ensure handouts dir exists
+            await self.ensure_handout_dir(session_id)
+            # Initialize session handouts
+            self._session_handouts[session_id] = list(uploaded_files or [])
+            # Copy any pre-uploaded handouts into container now that it exists
+            if self._session_handouts[session_id]:
+                base_dir = os.path.join("data", "handouts", session_id)
+                for name in self._session_handouts[session_id]:
+                    host_path = os.path.join(base_dir, name)
+                    dest_path = f"/workspace/handouts/{name}"
+                    try:
+                        ok = await self.copy_host_file_to_container(session_id, host_path, dest_path)
+                        if not ok:
+                            logger.warning(f"Failed to copy pre-uploaded handout {name} to container for session {session_id}")
+                    except Exception as e:
+                        logger.warning(f"Error copying pre-uploaded handout {name}: {e}")
             
             # Send initial status update
             if callback:
@@ -116,7 +154,13 @@ class CTFAgent:
                 await callback("action", init_action.dict())
             
             # Start with challenge analysis - let AI decide what tools it needs
-            analysis_prompt = self._build_analysis_prompt(challenge_url, flag_format, challenge_type, description)
+            analysis_prompt = self._build_analysis_prompt(
+                challenge_url,
+                flag_format,
+                challenge_type,
+                description,
+                self._session_handouts.get(session_id, [])
+            )
             analysis_actions = await self._execute_with_ai(
                 session_id,
                 analysis_prompt,
@@ -144,7 +188,12 @@ class CTFAgent:
                     break
                 
                 # Get next single action from AI
-                next_prompt = self._build_iteration_prompt(actions, flag_format, i)
+                next_prompt = self._build_iteration_prompt(
+                    actions,
+                    flag_format,
+                    i,
+                    self._session_handouts.get(session_id, [])
+                )
                 iteration_actions = await self._execute_with_ai(
                     session_id,
                     next_prompt,
@@ -194,8 +243,14 @@ class CTFAgent:
                     if action.command:
                         recent_context += f"Executed: {action.command}\n"
                         if action.output and len(action.output.strip()) > 0:
-                            output_preview = action.output[:500] + "..." if len(action.output) > 500 else action.output
-                            recent_context += f"Result: {output_preview}\n"
+                            # Extract and include FULL STDOUT (not truncated)
+                            stdout_match = re.search(r'STDOUT:\n(.*?)(?:\n\nSTDERR:|$)', action.output, re.DOTALL)
+                            if stdout_match:
+                                stdout_content = stdout_match.group(1)
+                                recent_context += f"STDOUT (full):\n{stdout_content}\n"
+                            else:
+                                # Fallback: include full recorded output
+                                recent_context += f"Output (full):\n{action.output}\n"
                 context_blocks.append(recent_context)
 
             user_block = f"User request:\n{prompt}"
@@ -396,22 +451,14 @@ class CTFAgent:
                         command = command.replace('TARGET_IP', actual_url)
                         logger.info(f"Replaced placeholder with actual URL: {command}")
                 
-                # Fix common truncation issues with sed commands
-                if "sed -n '" in command and not command.endswith("'"):
-                    # Check if it ends with a pattern like '1,200p without closing quote
-                    import re
-                    sed_pattern = r"sed -n '(\d+,\d+p)$"
-                    match = re.search(sed_pattern, command)
-                    if match:
-                        command += "'"
-                        logger.info(f"Fixed truncated sed command: {command}")
-                
-                # Fix other common quote truncation patterns
-                if command.count("'") % 2 == 1:  # Odd number of single quotes
-                    # Common patterns where we can safely add closing quote
-                    if any(pattern in command for pattern in ["sed -n '", "awk '", "grep '"]):
-                        command += "'"
-                        logger.info(f"Fixed unmatched single quote: {command}")
+                # If command is reading a full file, encourage using cat (less confusion on output)
+                if re.search(r"sed\s+-n\s+'1,\d+p'\s+\S+", command):
+                    # Replace with cat for clarity
+                    file_match = re.search(r"sed\s+-n\s+'1,\d+p'\s+(\S+)", command)
+                    if file_match:
+                        file_path = file_match.group(1)
+                        command = f"cat {file_path}"
+                        logger.info(f"Rewrote sed full-file read to cat: {command}")
                 
                 if not command or len(command.strip()) == 0:
                     continue
@@ -482,7 +529,7 @@ class CTFAgent:
         return """You are an expert CTF challenge solver. Analyze the target and find the flag.
 
 TOOLS AVAILABLE:
-curl, wget, python3, nmap, grep, strings, base64, openssl, hashcat, john, binwalk, steghide, and many others.
+ curl, wget, python3, cat, nmap, grep, strings, base64, openssl, hashcat, john, binwalk, steghide, and many others.
 
 IMPORTANT:
 • Use /workspace for temporary files (not /tmp)
@@ -491,7 +538,7 @@ IMPORTANT:
 
 WEB CHALLENGE STRATEGY (one step at a time):
 At each turn, propose exactly ONE shell command with a short reasoning.
-Prefer: curl -sSL (and -c/-b cookies when needed). Use actual URLs, no placeholders.
+If a handout exists, use it to understand the app, BUT the real interaction must target the provided URL (e.g., curl the site). Alternate between reading handout and interacting with the live site. If any handout file is an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted using tar/unzip/7z; do not re-extract if already extracted. Prefer: curl -sSL (and -c/-b cookies when needed). Use actual URLs, no placeholders.
 
 RESPONSE FORMAT:
 Respond with ONLY a single JSON object with fields {command, reasoning}:
@@ -503,16 +550,24 @@ Respond with ONLY a single JSON object with fields {command, reasoning}:
 
 No other text. Just the JSON object."""
 
-    def _build_analysis_prompt(self, url: str, flag_format: str, challenge_type: Optional[ChallengeType], description: Optional[str]) -> str:
+    def _build_analysis_prompt(self, url: str, flag_format: str, challenge_type: Optional[ChallengeType], description: Optional[str], uploaded_files: List[str]) -> str:
         """Build initial analysis prompt."""
         desc = (description or "").strip()
         desc_block = f"Description: {desc}\n\n" if desc else ""
+        handout_hint = "All uploaded handout files are available under /workspace/handouts.\n" \
+            "Use appropriate tools (tar, unzip, strings, file, binwalk) to inspect them.\n" \
+            "If any handout appears to be an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted (e.g., mkdir -p /workspace/handouts/extracted && cd /workspace/handouts/extracted && tar -xvf ../file.tar.gz || unzip -o ../file.zip). Avoid re-extracting if the directory already exists.\n\n" \
+            "When a URL is provided, always prioritize interacting with the live site to retrieve the real flag; use handouts only to inform your next live request."
+        files_block = ""
+        if uploaded_files:
+            files_list = "\n".join(f"- /workspace/handouts/{name}" for name in uploaded_files)
+            files_block = f"Handout files:\n{files_list}\n\n"
         return f"""Target: {url}
 Flag format: {flag_format}
 {desc_block}
-Start analyzing this challenge to find the flag. Propose exactly ONE command as a JSON object (keys: command, reasoning)."""
+{files_block}{handout_hint}Start analyzing this challenge to find the flag. Propose exactly ONE command as a JSON object (keys: command, reasoning)."""
 
-    def _build_iteration_prompt(self, actions: List[AgentAction], flag_format: str, iteration: int) -> str:
+    def _build_iteration_prompt(self, actions: List[AgentAction], flag_format: str, iteration: int, uploaded_files: List[str]) -> str:
         """Build prompt for iterative solving."""
         import re  # For regex operations
         
@@ -539,10 +594,15 @@ Start analyzing this challenge to find the flag. Propose exactly ONE command as 
                         context += f"  → Failed\n"
                 context += "\n"
         
+        files_block = ""
+        if uploaded_files:
+            files_list = "\n".join(f"- /workspace/handouts/{name}" for name in uploaded_files)
+            files_block = f"Available handout files (re-usable):\n{files_list}\n\n"
         return f"""{context}
 Flag format: {flag_format}
 
-Continue working toward finding the flag. Propose exactly ONE next shell command with a short reasoning. Use actual URLs and include -sSL. Return only a single JSON object with keys command and reasoning."""
+{files_block}
+Continue working toward finding the flag. If handouts include an archive and it is not yet extracted, extract it FIRST into /workspace/handouts/extracted. Propose exactly ONE next shell command with a short reasoning. If you just read a local file, avoid reprinting it fully again; summarize and move on to the next investigative step (often a live request to the URL). Use actual URLs and include -sSL. Return only a single JSON object with keys command and reasoning."""
 
     def _parse_ai_response(self, response: str) -> List[Dict[str, str]]:
         """Parse AI response to extract commands with improved error handling."""

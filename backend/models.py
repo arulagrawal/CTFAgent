@@ -48,6 +48,7 @@ class ChallengeSession(BaseModel):
     found_flag: Optional[str] = None
     container_id: Optional[str] = None
     error_message: Optional[str] = None
+    uploaded_files: List[str] = []  # Filenames available in /workspace/handouts
 
 
 class WebSocketMessage(BaseModel):
