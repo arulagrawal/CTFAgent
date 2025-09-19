@@ -93,6 +93,7 @@ class CTFAgent:
         challenge_url: str,
         flag_format: str,
         challenge_type: Optional[ChallengeType] = None,
+        description: Optional[str] = None,
         callback: Optional[Callable] = None
     ) -> List[AgentAction]:
         """Main method to solve a CTF challenge."""
@@ -115,7 +116,7 @@ class CTFAgent:
                 await callback("action", init_action.dict())
             
             # Start with challenge analysis - let AI decide what tools it needs
-            analysis_prompt = self._build_analysis_prompt(challenge_url, flag_format, challenge_type)
+            analysis_prompt = self._build_analysis_prompt(challenge_url, flag_format, challenge_type, description)
             analysis_actions = await self._execute_with_ai(
                 session_id,
                 analysis_prompt,
@@ -502,12 +503,14 @@ Respond with ONLY a single JSON object with fields {command, reasoning}:
 
 No other text. Just the JSON object."""
 
-    def _build_analysis_prompt(self, url: str, flag_format: str, challenge_type: Optional[ChallengeType]) -> str:
+    def _build_analysis_prompt(self, url: str, flag_format: str, challenge_type: Optional[ChallengeType], description: Optional[str]) -> str:
         """Build initial analysis prompt."""
+        desc = (description or "").strip()
+        desc_block = f"Description: {desc}\n\n" if desc else ""
         return f"""Target: {url}
 Flag format: {flag_format}
-
-Start analyzing this challenge to find the flag."""
+{desc_block}
+Start analyzing this challenge to find the flag. Propose exactly ONE command as a JSON object (keys: command, reasoning)."""
 
     def _build_iteration_prompt(self, actions: List[AgentAction], flag_format: str, iteration: int) -> str:
         """Build prompt for iterative solving."""

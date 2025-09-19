@@ -242,6 +242,7 @@ async def solve_challenge_background(session_id: str, request: ChallengeRequest)
             challenge_url=str(request.url),
             flag_format=request.flag_format,
             challenge_type=request.challenge_type,
+            description=request.description,
             callback=websocket_callback
         )
         
