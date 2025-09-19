@@ -856,9 +856,10 @@ Continue working toward finding the flag. If handouts include an archive and it 
                     if stdout_content and not any(phrase in stdout_content.lower() for phrase in [
                         'flag format:', 'flag pattern:', 'target flag:', 'looking for:', 'searching for:'
                     ]):
-                        match = pattern.search(stdout_content)
-                        if match:
-                            return match.group(0)
+                        for match in pattern.finditer(stdout_content):
+                            candidate = match.group(0)
+                            if 'fake' not in candidate.lower():
+                                return candidate
                 else:
                     # Fallback: search full output but exclude command lines and metadata
                     lines = action.output.split('\n')
@@ -868,8 +869,9 @@ Continue working toward finding the flag. If handouts include an archive and it 
                     if content and not any(phrase in content.lower() for phrase in [
                         'flag format:', 'flag pattern:', 'target flag:', 'looking for:', 'searching for:'
                     ]):
-                        match = pattern.search(content)
-                        if match:
-                            return match.group(0)
+                        for match in pattern.finditer(content):
+                            candidate = match.group(0)
+                            if 'fake' not in candidate.lower():
+                                return candidate
         
         return None
