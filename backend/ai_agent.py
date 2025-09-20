@@ -163,6 +163,40 @@ class CTFAgent:
         
         return None
 
+    def _is_pyjail_context(self, description: Optional[str], uploaded_files: List[str], actions: List[AgentAction]) -> bool:
+        """Heuristically detect if this looks like a Python jail/REPL challenge."""
+        try:
+            desc = (description or "").lower()
+            indicators = [
+                "pyjail", "python jail", "python repl", "repl", "sandbox",
+                "builtins", "__import__", ">>>", "traceback", "nameerror", "pdb"
+            ]
+            if any(tok in desc for tok in indicators):
+                return True
+            for name in uploaded_files:
+                n = (name or "").lower()
+                if n.endswith('.py') or ('jail' in n and 'py' in n):
+                    return True
+            # Look at recent outputs for Python prompts/errors
+            for action in actions[-5:]:
+                out = (action.output or "").lower()
+                if any(tok in out for tok in [">>>", "traceback (most recent call last)", "nameerror", "attributeerror", "builtins", "pdb"]):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _get_pyjail_guidance(self) -> str:
+        lines = [
+            "PYJAIL HINTS:",
+            "- Try breakpoint() to enter pdb; from pdb, import os and system to execute commands.",
+            "- Use builtins/__import__: import builtins; builtins.__import__('os').system('sh').",
+            "- Use object.__subclasses__() to find Popen or file-like classes and pivot to exec/read.",
+            "- Build blocked strings via chr()/bytes: ''.join(chr(x) for x in [111,115]) -> 'os'.",
+            "- Send raw bytes when Unicode is filtered; use printf -e '\\xNN' or a short python3 script to send bytes.",
+        ]
+        return "\n".join(lines)
+
     async def _check_container_health(self, session_id: str) -> Optional[str]:
         """Check container health and return diagnostic information."""
         try:
@@ -673,7 +707,7 @@ class CTFAgent:
         return """You are an expert CTF challenge solver. Analyze the target and find the flag.
 
 TOOLS AVAILABLE:
-curl, wget, python3, cat, grep, strings, base64, openssl, hashcat, john, binwalk, steghide, netcat/ncat/telnet, and pwntools (via python3), and many others.
+curl, wget, python3, cat, grep, strings, base64, openssl, hashcat, john, binwalk, steghide, and pwntools (via python3), and many others.
 
 IMPORTANT:
 • Use /workspace for temporary files (not /tmp)
@@ -682,11 +716,21 @@ IMPORTANT:
 
 GENERAL STRATEGY (one step at a time):
 At each turn, propose exactly ONE shell command with a short reasoning.
-If a URL is provided, prioritize interacting with the live site (e.g., curl -sSL ...).
+If a URL is provided, prioritize interacting with the live site (e.g., curl -sSLi ...).
 If a socket host:port is provided, do NOT assume HTTP. Interact using python3 with pwntools. Only use curl or HTTP tools if an HTTP banner/response explicitly confirms HTTP.
 For multi-step interactive sockets, prefer pwntools scripts saved under /workspace (e.g., /workspace/solve.py) and run with python3.
 If handouts are provided, use them to inform live interactions or solve handout-only challenges.
 If any handout is an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted (avoid re-extracting if already extracted).
+
+PYTHON JAIL STRATEGY (when interacting with Python REPL/jail):
+• Try quick escapes: breakpoint() to drop into pdb (then use !/!shell to run commands), help(), dir(), vars(), locals(), globals().
+• Leverage builtins: import builtins; builtins.__import__('os').system('sh'), or __import__('os').popen('sh').read().
+• Explore object graph: object.__subclasses__() to locate Popen or IO classes to execute commands/read files.
+• Bypass filters: build names dynamically (chr(), bytes, join) to avoid blacklists; consider non‑Unicode payloads.
+• For sockets, prefer pwntools; to send bytes, write small python3 scripts rather than echo.
+
+IMPORTANT:
+Always extract archives first. Always look at the contents of the archive before trying to solve the challenge.
 
 RESPONSE FORMAT:
 Respond with ONLY a single JSON object with fields {command, reasoning}:
@@ -737,6 +781,9 @@ No other text. Just the JSON object."""
         if not url and not (socket_host and socket_port):
             guidance_lines.append("No remote target provided; focus on analyzing handouts to recover the flag.")
 
+        if self._is_pyjail_context(description, uploaded_files, []):
+            guidance_lines.append("")
+            guidance_lines.append(self._get_pyjail_guidance())
         guidance = "\n".join(guidance_lines)
 
         return f"""{chr(10).join(target_block)}
@@ -804,6 +851,8 @@ Start analyzing this challenge to find the flag. Propose exactly ONE command as 
         if not url and not (socket_host and socket_port):
             guidance_lines.append("No remote target provided; progress by analyzing handouts systematically.")
 
+        if self._is_pyjail_context(None, uploaded_files, actions):
+            guidance_lines.append(self._get_pyjail_guidance())
         guidance = " ".join(guidance_lines)
 
         return f"""{context}
