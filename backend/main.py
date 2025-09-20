@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Dict, List
 import json
+import re
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -381,6 +382,16 @@ async def solve_challenge_background_form(session_id: str, url: str | None, host
         # Update session with results
         session.actions = actions
         session.updated_at = datetime.now(timezone.utc)
+        # Store estimated cost on session if available
+        try:
+            usage_action = ai_agent.build_usage_summary_action(session_id) if ai_agent else None
+            if usage_action and usage_action.output:
+                # Extract cost from summary line
+                m = re.search(r"Estimated cost: \$(\d+\.\d+)", usage_action.output)
+                if m:
+                    session.estimated_cost_usd = float(m.group(1))
+        except Exception:
+            pass
         
         # Check if flag was found
         flag_found = any(action.action_type == "flag_found" for action in actions)
@@ -397,6 +408,20 @@ async def solve_challenge_background_form(session_id: str, url: str | None, host
         session.status = ChallengeStatus.FAILED
         session.error_message = "Stopped by user"
         session.updated_at = datetime.now(timezone.utc)
+        # Emit usage summary if available
+        try:
+            if ai_agent:
+                usage_action = ai_agent.build_usage_summary_action(session_id)
+                if usage_action:
+                    session.actions.append(usage_action)
+                    await websocket_manager.send_message(session_id, WebSocketMessage(type="action", session_id=session_id, data=usage_action.dict()))
+                    # Extract and store cost on session
+                    if usage_action.output:
+                        m = re.search(r"Estimated cost: \$(\d+\.\d+)", usage_action.output)
+                        if m:
+                            session.estimated_cost_usd = float(m.group(1))
+        except Exception:
+            pass
         # Attempt cleanup
         try:
             if ai_agent:
@@ -419,6 +444,16 @@ async def solve_challenge_background_form(session_id: str, url: str | None, host
         session.status = ChallengeStatus.FAILED
         session.error_message = str(e)
         session.updated_at = datetime.now(timezone.utc)
+        # Store estimated cost on session if available
+        try:
+            if ai_agent:
+                usage_action = ai_agent.build_usage_summary_action(session_id)
+                if usage_action and usage_action.output:
+                    m = re.search(r"Estimated cost: \$(\d+\.\d+)", usage_action.output)
+                    if m:
+                        session.estimated_cost_usd = float(m.group(1))
+        except Exception:
+            pass
         
         # Send error via WebSocket
         error_message = WebSocketMessage(

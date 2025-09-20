@@ -53,6 +53,7 @@ class ChallengeSession(BaseModel):
     container_id: Optional[str] = None
     error_message: Optional[str] = None
     uploaded_files: List[str] = []  # Filenames available in /workspace/handouts
+    estimated_cost_usd: Optional[float] = None
 
 
 class WebSocketMessage(BaseModel):

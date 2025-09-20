@@ -20,6 +20,95 @@ class CTFAgent:
         self.docker_manager = DockerManager()
         self._ensured_handout_dir: Dict[str, bool] = {}
         self._session_handouts: Dict[str, List[str]] = {}
+        # Track OpenAI usage per session
+        self._session_usage: Dict[str, Dict[str, Any]] = {}
+
+    def _init_usage(self, session_id: str) -> None:
+        self._session_usage[session_id] = {
+            "model": self.model,
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    def _update_usage_from_response(self, session_id: str, response: Any) -> None:
+        try:
+            stats = self._session_usage.setdefault(session_id, {
+                "model": self.model,
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            })
+            usage = getattr(response, "usage", None)
+            if not usage:
+                # Try alternative locations/shapes
+                usage = getattr(getattr(response, "choices", [{}])[0], "usage", None)
+            if not usage:
+                return
+            # Handle both Responses API and Chat Completions shapes
+            input_tokens = getattr(usage, "input_tokens", None)
+            if input_tokens is None:
+                input_tokens = getattr(usage, "prompt_tokens", 0)
+            output_tokens = getattr(usage, "output_tokens", None)
+            if output_tokens is None:
+                output_tokens = getattr(usage, "completion_tokens", 0)
+            total_tokens = getattr(usage, "total_tokens", None)
+            if total_tokens is None:
+                total_tokens = (input_tokens or 0) + (output_tokens or 0)
+
+            stats["requests"] += 1
+            stats["input_tokens"] += int(input_tokens or 0)
+            stats["output_tokens"] += int(output_tokens or 0)
+            stats["total_tokens"] += int(total_tokens or 0)
+        except Exception:
+            # Best effort; ignore errors in metering
+            pass
+
+    def _estimate_cost_usd(self, session_id: str) -> Optional[float]:
+        stats = self._session_usage.get(session_id)
+        if not stats:
+            return None
+        try:
+            model_name = str(stats.get("model", self.model)).lower()
+            # Default to gpt-5 pricing unless explicitly mini
+            if "mini" in model_name or model_name.replace(" ", "").replace("_", "-") in ("gpt-5-mini", "gpt5-mini"):
+                price_in = 0.250  # USD per 1M input tokens
+                price_out = 2.000  # USD per 1M output tokens
+            else:
+                price_in = 1.250  # USD per 1M input tokens
+                price_out = 10.000  # USD per 1M output tokens
+
+            cost = (stats["input_tokens"] / 1_000_000) * price_in + (stats["output_tokens"] / 1_000_000) * price_out
+            return round(cost, 6)
+        except Exception:
+            return None
+
+    def _build_usage_summary_action(self, session_id: str) -> Optional[AgentAction]:
+        stats = self._session_usage.get(session_id)
+        if not stats:
+            return None
+        estimated_cost = self._estimate_cost_usd(session_id)
+        cost_str = f"${estimated_cost:.6f}" if estimated_cost is not None else "N/A"
+        summary = (
+            f"Usage summary for model {stats.get('model', self.model)}\n"
+            f"Requests: {stats.get('requests', 0)}\n"
+            f"Input tokens: {stats.get('input_tokens', 0)}\n"
+            f"Output tokens: {stats.get('output_tokens', 0)}\n"
+            f"Total tokens: {stats.get('total_tokens', 0)}\n"
+            f"Estimated cost: {cost_str}"
+        )
+        return AgentAction(
+            timestamp=datetime.now(timezone.utc),
+            action_type="usage_summary",
+            output=summary,
+            reasoning="Session token usage and cost estimate",
+            success=True,
+        )
+
+    def build_usage_summary_action(self, session_id: str) -> Optional[AgentAction]:
+        return self._build_usage_summary_action(session_id)
 
     async def ensure_handout_dir(self, session_id: str) -> None:
         """Ensure /workspace/handouts exists inside the container."""
@@ -124,6 +213,8 @@ class CTFAgent:
         actions = []
         
         try:
+            # Initialize usage tracking
+            self._init_usage(session_id)
             # Create container
             await self.docker_manager.create_container(session_id)
             # Ensure handouts dir exists
@@ -221,6 +312,15 @@ class CTFAgent:
                 if not iteration_actions:
                     break
             
+            # Append usage summary before returning
+            try:
+                usage_action = self._build_usage_summary_action(session_id)
+                if usage_action:
+                    actions.append(usage_action)
+                    if callback:
+                        await callback("action", usage_action.dict())
+            except Exception:
+                pass
             return actions
             
         except asyncio.CancelledError:
@@ -237,6 +337,15 @@ class CTFAgent:
             actions.append(error_action)
             if callback:
                 await callback("error", error_action.dict())
+            # Append usage summary on error
+            try:
+                usage_action = self._build_usage_summary_action(session_id)
+                if usage_action:
+                    actions.append(usage_action)
+                    if callback:
+                        await callback("action", usage_action.dict())
+            except Exception:
+                pass
             return actions
 
     async def _execute_with_ai(
@@ -296,6 +405,8 @@ class CTFAgent:
                         }
                     }
                 )
+                # Track usage for Responses API
+                self._update_usage_from_response(session_id, response)
                 use_responses_api = True
             except Exception as e:
                 logger.warning(f"Responses API call failed, falling back to chat.completions: {e}")
@@ -309,6 +420,8 @@ class CTFAgent:
                     max_completion_tokens=10000,
                     reasoning_effort="medium"
                 )
+                # Track usage for Chat Completions
+                self._update_usage_from_response(session_id, response)
                 use_responses_api = False
 
             # Extract output text
@@ -409,6 +522,7 @@ class CTFAgent:
                                 }
                             }
                         )
+                        self._update_usage_from_response(session_id, followup_response)
                         followup_text = getattr(followup_response, "output_text", "") or ""
                     except Exception as e2:
                         logger.warning(f"Responses API follow-up failed, falling back: {e2}")
@@ -421,6 +535,7 @@ class CTFAgent:
                             max_completion_tokens=500,
                             reasoning_effort="medium"
                         )
+                        self._update_usage_from_response(session_id, followup_cc)
                         followup_text = followup_cc.choices[0].message.content
                     try:
                         parsed_fu = json.loads(followup_text)
@@ -558,7 +673,7 @@ class CTFAgent:
         return """You are an expert CTF challenge solver. Analyze the target and find the flag.
 
 TOOLS AVAILABLE:
- curl, wget, python3, cat, nmap, grep, strings, base64, openssl, hashcat, john, binwalk, steghide, netcat/ncat/telnet, and pwntools (via python3), and many others.
+curl, wget, python3, cat, grep, strings, base64, openssl, hashcat, john, binwalk, steghide, netcat/ncat/telnet, and pwntools (via python3), and many others.
 
 IMPORTANT:
 • Use /workspace for temporary files (not /tmp)
@@ -568,7 +683,7 @@ IMPORTANT:
 GENERAL STRATEGY (one step at a time):
 At each turn, propose exactly ONE shell command with a short reasoning.
 If a URL is provided, prioritize interacting with the live site (e.g., curl -sSL ...).
-If a socket host:port is provided, do NOT assume HTTP. Interact using nc/ncat/telnet or python3 with pwntools. Only use curl or HTTP tools if an HTTP banner/response explicitly confirms HTTP.
+If a socket host:port is provided, do NOT assume HTTP. Interact using python3 with pwntools. Only use curl or HTTP tools if an HTTP banner/response explicitly confirms HTTP.
 For multi-step interactive sockets, prefer pwntools scripts saved under /workspace (e.g., /workspace/solve.py) and run with python3.
 If handouts are provided, use them to inform live interactions or solve handout-only challenges.
 If any handout is an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted (avoid re-extracting if already extracted).
@@ -618,7 +733,7 @@ No other text. Just the JSON object."""
         if url:
             guidance_lines.append("Prioritize interacting with the live site using curl -sSL; use handouts to inform requests.")
         if socket_host and socket_port:
-            guidance_lines.append("This is a socket challenge: do NOT assume HTTP. Use nc/ncat/telnet or python3 with pwntools. Only switch to HTTP tooling if an HTTP response is confirmed. Consider banner grabbing and protocol exploration.")
+            guidance_lines.append("This is a socket challenge: do NOT assume HTTP. Use python3 with pwntools. Only switch to HTTP tooling if an HTTP response is confirmed. Consider banner grabbing and protocol exploration.")
         if not url and not (socket_host and socket_port):
             guidance_lines.append("No remote target provided; focus on analyzing handouts to recover the flag.")
 
@@ -685,7 +800,7 @@ Start analyzing this challenge to find the flag. Propose exactly ONE command as 
         if url:
             guidance_lines.append("Prefer interacting with the live site using curl -sSL; alternate between handout insights and live probing.")
         if socket_host and socket_port:
-            guidance_lines.append("Socket target: do NOT assume HTTP. Use nc/ncat/telnet or python3 with pwntools; try banner grabbing, help commands, or known protocols; consider nmap -sC -sV. Only use HTTP tools if HTTP is confirmed.")
+            guidance_lines.append("Socket target: do NOT assume HTTP. Use python3 with pwntools; Only use HTTP tools if HTTP is confirmed.")
         if not url and not (socket_host and socket_port):
             guidance_lines.append("No remote target provided; progress by analyzing handouts systematically.")
 
