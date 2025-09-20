@@ -21,7 +21,9 @@ class ChallengeStatus(str, Enum):
 
 
 class ChallengeRequest(BaseModel):
-    url: HttpUrl
+    url: Optional[HttpUrl] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
     flag_format: str = "flag{.*}"
     challenge_type: Optional[ChallengeType] = None
     description: Optional[str] = None
@@ -39,7 +41,9 @@ class AgentAction(BaseModel):
 
 class ChallengeSession(BaseModel):
     session_id: str
-    challenge_url: str
+    challenge_url: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
     flag_format: str
     status: ChallengeStatus
     created_at: datetime
@@ -49,6 +53,7 @@ class ChallengeSession(BaseModel):
     container_id: Optional[str] = None
     error_message: Optional[str] = None
     uploaded_files: List[str] = []  # Filenames available in /workspace/handouts
+    estimated_cost_usd: Optional[float] = None
 
 
 class WebSocketMessage(BaseModel):

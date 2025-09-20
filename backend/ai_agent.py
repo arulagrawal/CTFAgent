@@ -20,6 +20,95 @@ class CTFAgent:
         self.docker_manager = DockerManager()
         self._ensured_handout_dir: Dict[str, bool] = {}
         self._session_handouts: Dict[str, List[str]] = {}
+        # Track OpenAI usage per session
+        self._session_usage: Dict[str, Dict[str, Any]] = {}
+
+    def _init_usage(self, session_id: str) -> None:
+        self._session_usage[session_id] = {
+            "model": self.model,
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    def _update_usage_from_response(self, session_id: str, response: Any) -> None:
+        try:
+            stats = self._session_usage.setdefault(session_id, {
+                "model": self.model,
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+            })
+            usage = getattr(response, "usage", None)
+            if not usage:
+                # Try alternative locations/shapes
+                usage = getattr(getattr(response, "choices", [{}])[0], "usage", None)
+            if not usage:
+                return
+            # Handle both Responses API and Chat Completions shapes
+            input_tokens = getattr(usage, "input_tokens", None)
+            if input_tokens is None:
+                input_tokens = getattr(usage, "prompt_tokens", 0)
+            output_tokens = getattr(usage, "output_tokens", None)
+            if output_tokens is None:
+                output_tokens = getattr(usage, "completion_tokens", 0)
+            total_tokens = getattr(usage, "total_tokens", None)
+            if total_tokens is None:
+                total_tokens = (input_tokens or 0) + (output_tokens or 0)
+
+            stats["requests"] += 1
+            stats["input_tokens"] += int(input_tokens or 0)
+            stats["output_tokens"] += int(output_tokens or 0)
+            stats["total_tokens"] += int(total_tokens or 0)
+        except Exception:
+            # Best effort; ignore errors in metering
+            pass
+
+    def _estimate_cost_usd(self, session_id: str) -> Optional[float]:
+        stats = self._session_usage.get(session_id)
+        if not stats:
+            return None
+        try:
+            model_name = str(stats.get("model", self.model)).lower()
+            # Default to gpt-5 pricing unless explicitly mini
+            if "mini" in model_name or model_name.replace(" ", "").replace("_", "-") in ("gpt-5-mini", "gpt5-mini"):
+                price_in = 0.250  # USD per 1M input tokens
+                price_out = 2.000  # USD per 1M output tokens
+            else:
+                price_in = 1.250  # USD per 1M input tokens
+                price_out = 10.000  # USD per 1M output tokens
+
+            cost = (stats["input_tokens"] / 1_000_000) * price_in + (stats["output_tokens"] / 1_000_000) * price_out
+            return round(cost, 6)
+        except Exception:
+            return None
+
+    def _build_usage_summary_action(self, session_id: str) -> Optional[AgentAction]:
+        stats = self._session_usage.get(session_id)
+        if not stats:
+            return None
+        estimated_cost = self._estimate_cost_usd(session_id)
+        cost_str = f"${estimated_cost:.6f}" if estimated_cost is not None else "N/A"
+        summary = (
+            f"Usage summary for model {stats.get('model', self.model)}\n"
+            f"Requests: {stats.get('requests', 0)}\n"
+            f"Input tokens: {stats.get('input_tokens', 0)}\n"
+            f"Output tokens: {stats.get('output_tokens', 0)}\n"
+            f"Total tokens: {stats.get('total_tokens', 0)}\n"
+            f"Estimated cost: {cost_str}"
+        )
+        return AgentAction(
+            timestamp=datetime.now(timezone.utc),
+            action_type="usage_summary",
+            output=summary,
+            reasoning="Session token usage and cost estimate",
+            success=True,
+        )
+
+    def build_usage_summary_action(self, session_id: str) -> Optional[AgentAction]:
+        return self._build_usage_summary_action(session_id)
 
     async def ensure_handout_dir(self, session_id: str) -> None:
         """Ensure /workspace/handouts exists inside the container."""
@@ -74,6 +163,40 @@ class CTFAgent:
         
         return None
 
+    def _is_pyjail_context(self, description: Optional[str], uploaded_files: List[str], actions: List[AgentAction]) -> bool:
+        """Heuristically detect if this looks like a Python jail/REPL challenge."""
+        try:
+            desc = (description or "").lower()
+            indicators = [
+                "pyjail", "python jail", "python repl", "repl", "sandbox",
+                "builtins", "__import__", ">>>", "traceback", "nameerror", "pdb"
+            ]
+            if any(tok in desc for tok in indicators):
+                return True
+            for name in uploaded_files:
+                n = (name or "").lower()
+                if n.endswith('.py') or ('jail' in n and 'py' in n):
+                    return True
+            # Look at recent outputs for Python prompts/errors
+            for action in actions[-5:]:
+                out = (action.output or "").lower()
+                if any(tok in out for tok in [">>>", "traceback (most recent call last)", "nameerror", "attributeerror", "builtins", "pdb"]):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _get_pyjail_guidance(self) -> str:
+        lines = [
+            "PYJAIL HINTS:",
+            "- Try breakpoint() to enter pdb; from pdb, import os and system to execute commands.",
+            "- Use builtins/__import__: import builtins; builtins.__import__('os').system('sh').",
+            "- Use object.__subclasses__() to find Popen or file-like classes and pivot to exec/read.",
+            "- Build blocked strings via chr()/bytes: ''.join(chr(x) for x in [111,115]) -> 'os'.",
+            "- Send raw bytes when Unicode is filtered; use printf -e '\\xNN' or a short python3 script to send bytes.",
+        ]
+        return "\n".join(lines)
+
     async def _check_container_health(self, session_id: str) -> Optional[str]:
         """Check container health and return diagnostic information."""
         try:
@@ -111,8 +234,10 @@ class CTFAgent:
     async def solve_challenge(
         self,
         session_id: str,
-        challenge_url: str,
-        flag_format: str,
+        challenge_url: Optional[str],
+        socket_host: Optional[str] = None,
+        socket_port: Optional[int] = None,
+        flag_format: str = "flag{.*}",
         challenge_type: Optional[ChallengeType] = None,
         description: Optional[str] = None,
         uploaded_files: Optional[List[str]] = None,
@@ -122,6 +247,8 @@ class CTFAgent:
         actions = []
         
         try:
+            # Initialize usage tracking
+            self._init_usage(session_id)
             # Create container
             await self.docker_manager.create_container(session_id)
             # Ensure handouts dir exists
@@ -146,7 +273,12 @@ class CTFAgent:
                 init_action = AgentAction(
                     timestamp=datetime.now(timezone.utc),
                     action_type="session_initialized",
-                    output=f"CTF Agent session started for {challenge_url}\nFlag format: {flag_format}\nContainer created successfully",
+                    output=(
+                        (f"CTF Agent session started. Target URL: {challenge_url}\n" if challenge_url else "") +
+                        (f"CTF Agent session started. Target SOCKET: {socket_host}:{socket_port}\n" if socket_host and socket_port else "") +
+                        ("CTF Agent session started. Handout-only challenge.\n" if not challenge_url and not (socket_host and socket_port) else "") +
+                        f"Flag format: {flag_format}\nContainer created successfully"
+                    ),
                     reasoning="Session initialization and container setup",
                     success=True
                 )
@@ -155,11 +287,13 @@ class CTFAgent:
             
             # Start with challenge analysis - let AI decide what tools it needs
             analysis_prompt = self._build_analysis_prompt(
-                challenge_url,
-                flag_format,
-                challenge_type,
-                description,
-                self._session_handouts.get(session_id, [])
+                url=challenge_url,
+                flag_format=flag_format,
+                challenge_type=challenge_type,
+                description=description,
+                uploaded_files=self._session_handouts.get(session_id, []),
+                socket_host=socket_host,
+                socket_port=socket_port
             )
             analysis_actions = await self._execute_with_ai(
                 session_id,
@@ -189,10 +323,13 @@ class CTFAgent:
                 
                 # Get next single action from AI
                 next_prompt = self._build_iteration_prompt(
-                    actions,
-                    flag_format,
-                    i,
-                    self._session_handouts.get(session_id, [])
+                    actions=actions,
+                    flag_format=flag_format,
+                    iteration=i,
+                    uploaded_files=self._session_handouts.get(session_id, []),
+                    url=challenge_url,
+                    socket_host=socket_host,
+                    socket_port=socket_port
                 )
                 iteration_actions = await self._execute_with_ai(
                     session_id,
@@ -209,8 +346,20 @@ class CTFAgent:
                 if not iteration_actions:
                     break
             
+            # Append usage summary before returning
+            try:
+                usage_action = self._build_usage_summary_action(session_id)
+                if usage_action:
+                    actions.append(usage_action)
+                    if callback:
+                        await callback("action", usage_action.dict())
+            except Exception:
+                pass
             return actions
             
+        except asyncio.CancelledError:
+            # Propagate cancellation so the background task can handle it
+            raise
         except Exception as e:
             error_action = AgentAction(
                 timestamp=datetime.now(timezone.utc),
@@ -222,6 +371,15 @@ class CTFAgent:
             actions.append(error_action)
             if callback:
                 await callback("error", error_action.dict())
+            # Append usage summary on error
+            try:
+                usage_action = self._build_usage_summary_action(session_id)
+                if usage_action:
+                    actions.append(usage_action)
+                    if callback:
+                        await callback("action", usage_action.dict())
+            except Exception:
+                pass
             return actions
 
     async def _execute_with_ai(
@@ -281,6 +439,8 @@ class CTFAgent:
                         }
                     }
                 )
+                # Track usage for Responses API
+                self._update_usage_from_response(session_id, response)
                 use_responses_api = True
             except Exception as e:
                 logger.warning(f"Responses API call failed, falling back to chat.completions: {e}")
@@ -291,9 +451,11 @@ class CTFAgent:
                 response = await self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    max_completion_tokens=4000,
+                    max_completion_tokens=10000,
                     reasoning_effort="medium"
                 )
+                # Track usage for Chat Completions
+                self._update_usage_from_response(session_id, response)
                 use_responses_api = False
 
             # Extract output text
@@ -394,6 +556,7 @@ class CTFAgent:
                                 }
                             }
                         )
+                        self._update_usage_from_response(session_id, followup_response)
                         followup_text = getattr(followup_response, "output_text", "") or ""
                     except Exception as e2:
                         logger.warning(f"Responses API follow-up failed, falling back: {e2}")
@@ -406,6 +569,7 @@ class CTFAgent:
                             max_completion_tokens=500,
                             reasoning_effort="medium"
                         )
+                        self._update_usage_from_response(session_id, followup_cc)
                         followup_text = followup_cc.choices[0].message.content
                     try:
                         parsed_fu = json.loads(followup_text)
@@ -442,14 +606,25 @@ class CTFAgent:
                 # Clean up any remaining quotes or artifacts (but preserve quotes inside the command)
                 command = command.strip('"{}[]')
                 
-                # Replace placeholder URLs with actual challenge URL if available
+                # Replace placeholder targets with actual values when present in prompt
+                # URL replacement
                 if 'TARGET_URL' in command or 'TARGET_IP' in command:
-                    # Try to extract URL from the prompt
-                    if 'Target: ' in prompt:
-                        actual_url = prompt.split('Target: ')[1].split()[0]
+                    actual_url_match = re.search(r'Target URL:\s*(\S+)', prompt)
+                    if actual_url_match:
+                        actual_url = actual_url_match.group(1)
                         command = command.replace('TARGET_URL', actual_url)
                         command = command.replace('TARGET_IP', actual_url)
                         logger.info(f"Replaced placeholder with actual URL: {command}")
+
+                # Socket replacement
+                if 'TARGET_HOST' in command or 'TARGET_PORT' in command:
+                    host_match = re.search(r'Target SOCKET:\s*([^:\s]+):(\d+)', prompt)
+                    if host_match:
+                        actual_host = host_match.group(1)
+                        actual_port = host_match.group(2)
+                        command = command.replace('TARGET_HOST', actual_host)
+                        command = command.replace('TARGET_PORT', actual_port)
+                        logger.info(f"Replaced placeholders with actual socket: {command}")
                 
                 # If command is reading a full file, encourage using cat (less confusion on output)
                 if re.search(r"sed\s+-n\s+'1,\d+p'\s+\S+", command):
@@ -509,6 +684,9 @@ class CTFAgent:
                 # Small delay to prevent overwhelming
                 await asyncio.sleep(0.5)
         
+        except asyncio.CancelledError:
+            # Propagate cancellation to stop immediately
+            raise
         except Exception as e:
             error_action = AgentAction(
                 timestamp=datetime.now(timezone.utc),
@@ -529,16 +707,30 @@ class CTFAgent:
         return """You are an expert CTF challenge solver. Analyze the target and find the flag.
 
 TOOLS AVAILABLE:
- curl, wget, python3, cat, nmap, grep, strings, base64, openssl, hashcat, john, binwalk, steghide, and many others.
+curl, wget, python3, cat, grep, strings, base64, openssl, hashcat, john, binwalk, steghide, and pwntools (via python3), and many others.
 
 IMPORTANT:
 • Use /workspace for temporary files (not /tmp)
 • Commands with pipes/redirects are automatically wrapped in bash
-• Use actual URLs, not placeholders like TARGET_URL
+• Use actual targets (URLs or socket host:port), not placeholders like TARGET_URL or TARGET_HOST/TARGET_PORT
 
-WEB CHALLENGE STRATEGY (one step at a time):
+GENERAL STRATEGY (one step at a time):
 At each turn, propose exactly ONE shell command with a short reasoning.
-If a handout exists, use it to understand the app, BUT the real interaction must target the provided URL (e.g., curl the site). Alternate between reading handout and interacting with the live site. If any handout file is an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted using tar/unzip/7z; do not re-extract if already extracted. Prefer: curl -sSL (and -c/-b cookies when needed). Use actual URLs, no placeholders.
+If a URL is provided, prioritize interacting with the live site (e.g., curl -sSLi ...).
+If a socket host:port is provided, do NOT assume HTTP. Interact using python3 with pwntools. Only use curl or HTTP tools if an HTTP banner/response explicitly confirms HTTP.
+For multi-step interactive sockets, prefer pwntools scripts saved under /workspace (e.g., /workspace/solve.py) and run with python3.
+If handouts are provided, use them to inform live interactions or solve handout-only challenges.
+If any handout is an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted (avoid re-extracting if already extracted).
+
+PYTHON JAIL STRATEGY (when interacting with Python REPL/jail):
+• Try quick escapes: breakpoint() to drop into pdb (then use !/!shell to run commands), help(), dir(), vars(), locals(), globals().
+• Leverage builtins: import builtins; builtins.__import__('os').system('sh'), or __import__('os').popen('sh').read().
+• Explore object graph: object.__subclasses__() to locate Popen or IO classes to execute commands/read files.
+• Bypass filters: build names dynamically (chr(), bytes, join) to avoid blacklists; consider non‑Unicode payloads.
+• For sockets, prefer pwntools; to send bytes, write small python3 scripts rather than echo.
+
+IMPORTANT:
+Always extract archives first. Always look at the contents of the archive before trying to solve the challenge.
 
 RESPONSE FORMAT:
 Respond with ONLY a single JSON object with fields {command, reasoning}:
@@ -550,25 +742,68 @@ Respond with ONLY a single JSON object with fields {command, reasoning}:
 
 No other text. Just the JSON object."""
 
-    def _build_analysis_prompt(self, url: str, flag_format: str, challenge_type: Optional[ChallengeType], description: Optional[str], uploaded_files: List[str]) -> str:
-        """Build initial analysis prompt."""
+    def _build_analysis_prompt(
+        self,
+        url: Optional[str],
+        flag_format: str,
+        challenge_type: Optional[ChallengeType],
+        description: Optional[str],
+        uploaded_files: List[str],
+        socket_host: Optional[str] = None,
+        socket_port: Optional[int] = None
+    ) -> str:
+        """Build initial analysis prompt tailored to URL, socket, or handout-only."""
         desc = (description or "").strip()
         desc_block = f"Description: {desc}\n\n" if desc else ""
-        handout_hint = "All uploaded handout files are available under /workspace/handouts.\n" \
-            "Use appropriate tools (tar, unzip, strings, file, binwalk) to inspect them.\n" \
-            "If any handout appears to be an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted (e.g., mkdir -p /workspace/handouts/extracted && cd /workspace/handouts/extracted && tar -xvf ../file.tar.gz || unzip -o ../file.zip). Avoid re-extracting if the directory already exists.\n\n" \
-            "When a URL is provided, always prioritize interacting with the live site to retrieve the real flag; use handouts only to inform your next live request."
         files_block = ""
         if uploaded_files:
             files_list = "\n".join(f"- /workspace/handouts/{name}" for name in uploaded_files)
             files_block = f"Handout files:\n{files_list}\n\n"
-        return f"""Target: {url}
+
+        target_block = []
+        if url:
+            target_block.append(f"Target URL: {url}")
+        if socket_host and socket_port:
+            target_block.append(f"Target SOCKET: {socket_host}:{socket_port}")
+        if not target_block:
+            target_block.append("Handout-only: No URL or socket provided")
+
+        # Tailor guidance
+        guidance_lines = [
+            "All uploaded handout files are available under /workspace/handouts.",
+            "Use tar, unzip, strings, file, binwalk, and other tools as appropriate.",
+            "If any handout is an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted (avoid re-extracting if it already exists)."
+        ]
+        if url:
+            guidance_lines.append("Prioritize interacting with the live site using curl -sSL; use handouts to inform requests.")
+        if socket_host and socket_port:
+            guidance_lines.append("This is a socket challenge: do NOT assume HTTP. Use python3 with pwntools. Only switch to HTTP tooling if an HTTP response is confirmed. Consider banner grabbing and protocol exploration.")
+        if not url and not (socket_host and socket_port):
+            guidance_lines.append("No remote target provided; focus on analyzing handouts to recover the flag.")
+
+        if self._is_pyjail_context(description, uploaded_files, []):
+            guidance_lines.append("")
+            guidance_lines.append(self._get_pyjail_guidance())
+        guidance = "\n".join(guidance_lines)
+
+        return f"""{chr(10).join(target_block)}
 Flag format: {flag_format}
 {desc_block}
-{files_block}{handout_hint}Start analyzing this challenge to find the flag. Propose exactly ONE command as a JSON object (keys: command, reasoning)."""
+{files_block}{guidance}
 
-    def _build_iteration_prompt(self, actions: List[AgentAction], flag_format: str, iteration: int, uploaded_files: List[str]) -> str:
-        """Build prompt for iterative solving."""
+Start analyzing this challenge to find the flag. Propose exactly ONE command as a JSON object (keys: command, reasoning)."""
+
+    def _build_iteration_prompt(
+        self,
+        actions: List[AgentAction],
+        flag_format: str,
+        iteration: int,
+        uploaded_files: List[str],
+        url: Optional[str] = None,
+        socket_host: Optional[str] = None,
+        socket_port: Optional[int] = None
+    ) -> str:
+        """Build prompt for iterative solving tailored to URL/socket/handout-only."""
         import re  # For regex operations
         
         # Give ALL history - no limits so GPT has complete context
@@ -598,11 +833,34 @@ Flag format: {flag_format}
         if uploaded_files:
             files_list = "\n".join(f"- /workspace/handouts/{name}" for name in uploaded_files)
             files_block = f"Available handout files (re-usable):\n{files_list}\n\n"
+        target_block = []
+        if url:
+            target_block.append(f"Target URL: {url}")
+        if socket_host and socket_port:
+            target_block.append(f"Target SOCKET: {socket_host}:{socket_port}")
+        if not target_block:
+            target_block.append("Handout-only: No URL or socket provided")
+
+        guidance_lines = [
+            "If handouts include an archive and it is not yet extracted, extract it FIRST into /workspace/handouts/extracted.",
+        ]
+        if url:
+            guidance_lines.append("Prefer interacting with the live site using curl -sSL; alternate between handout insights and live probing.")
+        if socket_host and socket_port:
+            guidance_lines.append("Socket target: do NOT assume HTTP. Use python3 with pwntools; Only use HTTP tools if HTTP is confirmed.")
+        if not url and not (socket_host and socket_port):
+            guidance_lines.append("No remote target provided; progress by analyzing handouts systematically.")
+
+        if self._is_pyjail_context(None, uploaded_files, actions):
+            guidance_lines.append(self._get_pyjail_guidance())
+        guidance = " ".join(guidance_lines)
+
         return f"""{context}
+{chr(10).join(target_block)}
 Flag format: {flag_format}
 
 {files_block}
-Continue working toward finding the flag. If handouts include an archive and it is not yet extracted, extract it FIRST into /workspace/handouts/extracted. Propose exactly ONE next shell command with a short reasoning. If you just read a local file, avoid reprinting it fully again; summarize and move on to the next investigative step (often a live request to the URL). Use actual URLs and include -sSL. Return only a single JSON object with keys command and reasoning."""
+Continue working toward finding the flag. {guidance} Propose exactly ONE next shell command with a short reasoning. If you just read a local file, avoid reprinting it fully; summarize and move on. Return only a single JSON object with keys command and reasoning."""
 
     def _parse_ai_response(self, response: str) -> List[Dict[str, str]]:
         """Parse AI response to extract commands with improved error handling."""
