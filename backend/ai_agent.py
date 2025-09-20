@@ -111,8 +111,10 @@ class CTFAgent:
     async def solve_challenge(
         self,
         session_id: str,
-        challenge_url: str,
-        flag_format: str,
+        challenge_url: Optional[str],
+        socket_host: Optional[str] = None,
+        socket_port: Optional[int] = None,
+        flag_format: str = "flag{.*}",
         challenge_type: Optional[ChallengeType] = None,
         description: Optional[str] = None,
         uploaded_files: Optional[List[str]] = None,
@@ -146,7 +148,12 @@ class CTFAgent:
                 init_action = AgentAction(
                     timestamp=datetime.now(timezone.utc),
                     action_type="session_initialized",
-                    output=f"CTF Agent session started for {challenge_url}\nFlag format: {flag_format}\nContainer created successfully",
+                    output=(
+                        (f"CTF Agent session started. Target URL: {challenge_url}\n" if challenge_url else "") +
+                        (f"CTF Agent session started. Target SOCKET: {socket_host}:{socket_port}\n" if socket_host and socket_port else "") +
+                        ("CTF Agent session started. Handout-only challenge.\n" if not challenge_url and not (socket_host and socket_port) else "") +
+                        f"Flag format: {flag_format}\nContainer created successfully"
+                    ),
                     reasoning="Session initialization and container setup",
                     success=True
                 )
@@ -155,11 +162,13 @@ class CTFAgent:
             
             # Start with challenge analysis - let AI decide what tools it needs
             analysis_prompt = self._build_analysis_prompt(
-                challenge_url,
-                flag_format,
-                challenge_type,
-                description,
-                self._session_handouts.get(session_id, [])
+                url=challenge_url,
+                flag_format=flag_format,
+                challenge_type=challenge_type,
+                description=description,
+                uploaded_files=self._session_handouts.get(session_id, []),
+                socket_host=socket_host,
+                socket_port=socket_port
             )
             analysis_actions = await self._execute_with_ai(
                 session_id,
@@ -189,10 +198,13 @@ class CTFAgent:
                 
                 # Get next single action from AI
                 next_prompt = self._build_iteration_prompt(
-                    actions,
-                    flag_format,
-                    i,
-                    self._session_handouts.get(session_id, [])
+                    actions=actions,
+                    flag_format=flag_format,
+                    iteration=i,
+                    uploaded_files=self._session_handouts.get(session_id, []),
+                    url=challenge_url,
+                    socket_host=socket_host,
+                    socket_port=socket_port
                 )
                 iteration_actions = await self._execute_with_ai(
                     session_id,
@@ -442,14 +454,25 @@ class CTFAgent:
                 # Clean up any remaining quotes or artifacts (but preserve quotes inside the command)
                 command = command.strip('"{}[]')
                 
-                # Replace placeholder URLs with actual challenge URL if available
+                # Replace placeholder targets with actual values when present in prompt
+                # URL replacement
                 if 'TARGET_URL' in command or 'TARGET_IP' in command:
-                    # Try to extract URL from the prompt
-                    if 'Target: ' in prompt:
-                        actual_url = prompt.split('Target: ')[1].split()[0]
+                    actual_url_match = re.search(r'Target URL:\s*(\S+)', prompt)
+                    if actual_url_match:
+                        actual_url = actual_url_match.group(1)
                         command = command.replace('TARGET_URL', actual_url)
                         command = command.replace('TARGET_IP', actual_url)
                         logger.info(f"Replaced placeholder with actual URL: {command}")
+
+                # Socket replacement
+                if 'TARGET_HOST' in command or 'TARGET_PORT' in command:
+                    host_match = re.search(r'Target SOCKET:\s*([^:\s]+):(\d+)', prompt)
+                    if host_match:
+                        actual_host = host_match.group(1)
+                        actual_port = host_match.group(2)
+                        command = command.replace('TARGET_HOST', actual_host)
+                        command = command.replace('TARGET_PORT', actual_port)
+                        logger.info(f"Replaced placeholders with actual socket: {command}")
                 
                 # If command is reading a full file, encourage using cat (less confusion on output)
                 if re.search(r"sed\s+-n\s+'1,\d+p'\s+\S+", command):
@@ -529,16 +552,20 @@ class CTFAgent:
         return """You are an expert CTF challenge solver. Analyze the target and find the flag.
 
 TOOLS AVAILABLE:
- curl, wget, python3, cat, nmap, grep, strings, base64, openssl, hashcat, john, binwalk, steghide, and many others.
+ curl, wget, python3, cat, nmap, grep, strings, base64, openssl, hashcat, john, binwalk, steghide, netcat/ncat/telnet, and pwntools (via python3), and many others.
 
 IMPORTANT:
 • Use /workspace for temporary files (not /tmp)
 • Commands with pipes/redirects are automatically wrapped in bash
-• Use actual URLs, not placeholders like TARGET_URL
+• Use actual targets (URLs or socket host:port), not placeholders like TARGET_URL or TARGET_HOST/TARGET_PORT
 
-WEB CHALLENGE STRATEGY (one step at a time):
+GENERAL STRATEGY (one step at a time):
 At each turn, propose exactly ONE shell command with a short reasoning.
-If a handout exists, use it to understand the app, BUT the real interaction must target the provided URL (e.g., curl the site). Alternate between reading handout and interacting with the live site. If any handout file is an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted using tar/unzip/7z; do not re-extract if already extracted. Prefer: curl -sSL (and -c/-b cookies when needed). Use actual URLs, no placeholders.
+If a URL is provided, prioritize interacting with the live site (e.g., curl -sSL ...).
+If a socket host:port is provided, do NOT assume HTTP. Interact using nc/ncat/telnet or python3 with pwntools. Only use curl or HTTP tools if an HTTP banner/response explicitly confirms HTTP.
+For multi-step interactive sockets, prefer pwntools scripts saved under /workspace (e.g., /workspace/solve.py) and run with python3.
+If handouts are provided, use them to inform live interactions or solve handout-only challenges.
+If any handout is an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted (avoid re-extracting if already extracted).
 
 RESPONSE FORMAT:
 Respond with ONLY a single JSON object with fields {command, reasoning}:
@@ -550,25 +577,65 @@ Respond with ONLY a single JSON object with fields {command, reasoning}:
 
 No other text. Just the JSON object."""
 
-    def _build_analysis_prompt(self, url: str, flag_format: str, challenge_type: Optional[ChallengeType], description: Optional[str], uploaded_files: List[str]) -> str:
-        """Build initial analysis prompt."""
+    def _build_analysis_prompt(
+        self,
+        url: Optional[str],
+        flag_format: str,
+        challenge_type: Optional[ChallengeType],
+        description: Optional[str],
+        uploaded_files: List[str],
+        socket_host: Optional[str] = None,
+        socket_port: Optional[int] = None
+    ) -> str:
+        """Build initial analysis prompt tailored to URL, socket, or handout-only."""
         desc = (description or "").strip()
         desc_block = f"Description: {desc}\n\n" if desc else ""
-        handout_hint = "All uploaded handout files are available under /workspace/handouts.\n" \
-            "Use appropriate tools (tar, unzip, strings, file, binwalk) to inspect them.\n" \
-            "If any handout appears to be an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted (e.g., mkdir -p /workspace/handouts/extracted && cd /workspace/handouts/extracted && tar -xvf ../file.tar.gz || unzip -o ../file.zip). Avoid re-extracting if the directory already exists.\n\n" \
-            "When a URL is provided, always prioritize interacting with the live site to retrieve the real flag; use handouts only to inform your next live request."
         files_block = ""
         if uploaded_files:
             files_list = "\n".join(f"- /workspace/handouts/{name}" for name in uploaded_files)
             files_block = f"Handout files:\n{files_list}\n\n"
-        return f"""Target: {url}
+
+        target_block = []
+        if url:
+            target_block.append(f"Target URL: {url}")
+        if socket_host and socket_port:
+            target_block.append(f"Target SOCKET: {socket_host}:{socket_port}")
+        if not target_block:
+            target_block.append("Handout-only: No URL or socket provided")
+
+        # Tailor guidance
+        guidance_lines = [
+            "All uploaded handout files are available under /workspace/handouts.",
+            "Use tar, unzip, strings, file, binwalk, and other tools as appropriate.",
+            "If any handout is an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted (avoid re-extracting if it already exists)."
+        ]
+        if url:
+            guidance_lines.append("Prioritize interacting with the live site using curl -sSL; use handouts to inform requests.")
+        if socket_host and socket_port:
+            guidance_lines.append("This is a socket challenge: do NOT assume HTTP. Use nc/ncat/telnet or python3 with pwntools. Only switch to HTTP tooling if an HTTP response is confirmed. Consider banner grabbing and protocol exploration.")
+        if not url and not (socket_host and socket_port):
+            guidance_lines.append("No remote target provided; focus on analyzing handouts to recover the flag.")
+
+        guidance = "\n".join(guidance_lines)
+
+        return f"""{chr(10).join(target_block)}
 Flag format: {flag_format}
 {desc_block}
-{files_block}{handout_hint}Start analyzing this challenge to find the flag. Propose exactly ONE command as a JSON object (keys: command, reasoning)."""
+{files_block}{guidance}
 
-    def _build_iteration_prompt(self, actions: List[AgentAction], flag_format: str, iteration: int, uploaded_files: List[str]) -> str:
-        """Build prompt for iterative solving."""
+Start analyzing this challenge to find the flag. Propose exactly ONE command as a JSON object (keys: command, reasoning)."""
+
+    def _build_iteration_prompt(
+        self,
+        actions: List[AgentAction],
+        flag_format: str,
+        iteration: int,
+        uploaded_files: List[str],
+        url: Optional[str] = None,
+        socket_host: Optional[str] = None,
+        socket_port: Optional[int] = None
+    ) -> str:
+        """Build prompt for iterative solving tailored to URL/socket/handout-only."""
         import re  # For regex operations
         
         # Give ALL history - no limits so GPT has complete context
@@ -598,11 +665,32 @@ Flag format: {flag_format}
         if uploaded_files:
             files_list = "\n".join(f"- /workspace/handouts/{name}" for name in uploaded_files)
             files_block = f"Available handout files (re-usable):\n{files_list}\n\n"
+        target_block = []
+        if url:
+            target_block.append(f"Target URL: {url}")
+        if socket_host and socket_port:
+            target_block.append(f"Target SOCKET: {socket_host}:{socket_port}")
+        if not target_block:
+            target_block.append("Handout-only: No URL or socket provided")
+
+        guidance_lines = [
+            "If handouts include an archive and it is not yet extracted, extract it FIRST into /workspace/handouts/extracted.",
+        ]
+        if url:
+            guidance_lines.append("Prefer interacting with the live site using curl -sSL; alternate between handout insights and live probing.")
+        if socket_host and socket_port:
+            guidance_lines.append("Socket target: do NOT assume HTTP. Use nc/ncat/telnet or python3 with pwntools; try banner grabbing, help commands, or known protocols; consider nmap -sC -sV. Only use HTTP tools if HTTP is confirmed.")
+        if not url and not (socket_host and socket_port):
+            guidance_lines.append("No remote target provided; progress by analyzing handouts systematically.")
+
+        guidance = " ".join(guidance_lines)
+
         return f"""{context}
+{chr(10).join(target_block)}
 Flag format: {flag_format}
 
 {files_block}
-Continue working toward finding the flag. If handouts include an archive and it is not yet extracted, extract it FIRST into /workspace/handouts/extracted. Propose exactly ONE next shell command with a short reasoning. If you just read a local file, avoid reprinting it fully again; summarize and move on to the next investigative step (often a live request to the URL). Use actual URLs and include -sSL. Return only a single JSON object with keys command and reasoning."""
+Continue working toward finding the flag. {guidance} Propose exactly ONE next shell command with a short reasoning. If you just read a local file, avoid reprinting it fully; summarize and move on. Return only a single JSON object with keys command and reasoning."""
 
     def _parse_ai_response(self, response: str) -> List[Dict[str, str]]:
         """Parse AI response to extract commands with improved error handling."""

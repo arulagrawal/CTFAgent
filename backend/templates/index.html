@@ -25,10 +25,38 @@
             
             <form id="challenge-form" class="space-y-4" enctype="multipart/form-data">
                 <div>
+                    <label for="target_type" class="block text-sm font-medium text-gray-700 mb-1">Target Type</label>
+                    <select id="target_type" name="target_type" 
+                            class="block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500">
+                        <option value="url" selected>URL</option>
+                        <option value="socket">Socket (host:port)</option>
+                        <option value="handout">Handout only</option>
+                    </select>
+                </div>
+
+                <div id="url-input-block">
                     <label for="url" class="block text-sm font-medium text-gray-700 mb-1">Challenge URL</label>
-                    <input type="url" id="url" name="url" required 
+                    <input type="url" id="url" name="url"
                            class="block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500"
                            placeholder="https://example.com/challenge">
+                </div>
+
+                <div id="socket-input-block" class="hidden">
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div>
+                            <label for="host" class="block text-sm font-medium text-gray-700 mb-1">Socket Host</label>
+                            <input type="text" id="host" name="host"
+                                   class="block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500"
+                                   placeholder="challenge.example.com">
+                        </div>
+                        <div>
+                            <label for="port" class="block text-sm font-medium text-gray-700 mb-1">Socket Port</label>
+                            <input type="number" id="port" name="port" min="1" max="65535"
+                                   class="block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500"
+                                   placeholder="1337">
+                        </div>
+                    </div>
+                    <p class="text-xs text-gray-500 mt-1">For socket challenges, the agent may use <code>nc</code>/<code>ncat</code>, <code>telnet</code>, or scripts to interact.</p>
                 </div>
 
                 <div>
@@ -126,11 +154,16 @@
                     </div>
                 </div>
 
-                <div>
+                <div id="url-status-block" class="hidden">
                     <span class="text-gray-500 text-sm">Challenge URL:</span>
                     <div class="mt-1">
                         <a id="challenge-url" href="#" target="_blank" class="text-blue-600 hover:text-blue-800 text-sm break-all"></a>
                     </div>
+                </div>
+
+                <div id="socket-status-block" class="hidden">
+                    <span class="text-gray-500 text-sm">Socket Target:</span>
+                    <div id="socket-target" class="mt-1 font-mono text-sm bg-gray-100 p-2 rounded"></div>
                 </div>
 
                 <div>
@@ -255,6 +288,8 @@ function setupEventListeners() {
     document.getElementById('stop-btn').addEventListener('click', stopChallenge);
     document.getElementById('delete-btn').addEventListener('click', deleteSession);
     document.getElementById('handout-upload-btn').addEventListener('click', uploadHandouts);
+    document.getElementById('target_type').addEventListener('change', onTargetTypeChange);
+    onTargetTypeChange();
 }
 
 async function checkApiHealth() {
@@ -268,11 +303,79 @@ async function checkApiHealth() {
     }
 }
 
+function onTargetTypeChange() {
+    const type = document.getElementById('target_type').value;
+    const urlBlock = document.getElementById('url-input-block');
+    const socketBlock = document.getElementById('socket-input-block');
+    const urlInput = document.getElementById('url');
+    const hostInput = document.getElementById('host');
+    const portInput = document.getElementById('port');
+
+    if (type === 'url') {
+        urlBlock.classList.remove('hidden');
+        socketBlock.classList.add('hidden');
+        if (urlInput) urlInput.required = true;
+        if (hostInput) hostInput.required = false;
+        if (portInput) portInput.required = false;
+    } else if (type === 'socket') {
+        urlBlock.classList.add('hidden');
+        socketBlock.classList.remove('hidden');
+        if (urlInput) urlInput.required = false;
+        if (hostInput) hostInput.required = true;
+        if (portInput) portInput.required = true;
+    } else {
+        // handout-only
+        urlBlock.classList.add('hidden');
+        socketBlock.classList.add('hidden');
+        if (urlInput) urlInput.required = false;
+        if (hostInput) hostInput.required = false;
+        if (portInput) portInput.required = false;
+    }
+}
+
 async function handleFormSubmit(event) {
     event.preventDefault();
     
     const formEl = event.target;
-    const formData = new FormData(formEl);
+    const formData = new FormData();
+    const targetType = document.getElementById('target_type').value;
+    const url = (document.getElementById('url').value || '').trim();
+    const host = (document.getElementById('host')?.value || '').trim();
+    const port = (document.getElementById('port')?.value || '').trim();
+    const flagFormat = document.getElementById('flag_format').value;
+    const challengeType = document.getElementById('challenge_type').value;
+    const description = document.getElementById('description').value;
+    const timeout = document.getElementById('timeout').value;
+    const model = document.getElementById('model').value;
+    const handoutsInput = document.getElementById('handouts');
+
+    if (targetType === 'url') {
+        if (!url) {
+            showError('Please provide a URL.');
+            return;
+        }
+        formData.append('url', url);
+    } else if (targetType === 'socket') {
+        if (!host || !port) {
+            showError('Please provide both host and port.');
+            return;
+        }
+        formData.append('host', host);
+        formData.append('port', port);
+    } else {
+        // handout-only: no url/host/port
+    }
+
+    formData.append('flag_format', flagFormat);
+    if (challengeType) formData.append('challenge_type', challengeType);
+    if (description) formData.append('description', description);
+    formData.append('timeout', timeout);
+    formData.append('model', model);
+    if (handoutsInput && handoutsInput.files && handoutsInput.files.length > 0) {
+        for (let i = 0; i < handoutsInput.files.length; i++) {
+            formData.append('handouts', handoutsInput.files[i]);
+        }
+    }
     
     try {
         setLoading(true);
@@ -397,8 +500,28 @@ function updateSessionStatus(session) {
     currentSession = session;
     
     document.getElementById('session-id').textContent = session.session_id;
-    document.getElementById('challenge-url').textContent = session.challenge_url;
-    document.getElementById('challenge-url').href = session.challenge_url;
+    const urlBlock = document.getElementById('url-status-block');
+    const socketBlock = document.getElementById('socket-status-block');
+    const urlEl = document.getElementById('challenge-url');
+    const socketEl = document.getElementById('socket-target');
+
+    if (session.challenge_url) {
+        urlBlock.classList.remove('hidden');
+        urlEl.textContent = session.challenge_url;
+        urlEl.href = session.challenge_url;
+    } else {
+        urlBlock.classList.add('hidden');
+        urlEl.textContent = '';
+        urlEl.href = '#';
+    }
+
+    if (session.host && session.port) {
+        socketBlock.classList.remove('hidden');
+        socketEl.textContent = `${session.host}:${session.port}`;
+    } else {
+        socketBlock.classList.add('hidden');
+        socketEl.textContent = '';
+    }
     document.getElementById('flag-format').textContent = session.flag_format;
     
     // Update status badge

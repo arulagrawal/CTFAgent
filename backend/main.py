@@ -111,7 +111,9 @@ async def health_check():
 
 @app.post("/challenges/start")
 async def start_challenge(
-    url: str = Form(...),
+    url: str | None = Form(None),
+    host: str | None = Form(None),
+    port: int | None = Form(None),
     flag_format: str = Form("flag{.*}"),
     challenge_type: str | None = Form(None),
     description: str | None = Form(None),
@@ -125,10 +127,16 @@ async def start_challenge(
     
     session_id = str(uuid.uuid4())
     
+    # Validate inputs: allow URL or socket or handout-only
+    if not url and not (host and port) and not handouts:
+        raise HTTPException(status_code=400, detail="Provide a URL, or a host+port, or at least one handout.")
+
     # Create session
     session = ChallengeSession(
         session_id=session_id,
-        challenge_url=str(url),
+        challenge_url=str(url) if url else None,
+        host=host,
+        port=port,
         flag_format=flag_format,
         found_flag=None,
         status=ChallengeStatus.PENDING,
@@ -155,7 +163,7 @@ async def start_challenge(
                 logger.error(f"Failed to save handout {file.filename}: {e}")
 
     # Start solving in background
-    asyncio.create_task(solve_challenge_background_form(session_id, url, flag_format, challenge_type, description, timeout, model))
+    asyncio.create_task(solve_challenge_background_form(session_id, url, host, port, flag_format, challenge_type, description, timeout, model))
     
     return {"session_id": session_id, "status": "started"}
 
@@ -280,7 +288,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         websocket_manager.disconnect(session_id)
 
 
-async def solve_challenge_background_form(session_id: str, url: str, flag_format: str, challenge_type: str | None, description: str | None, timeout: int, model: str):
+async def solve_challenge_background_form(session_id: str, url: str | None, host: str | None, port: int | None, flag_format: str, challenge_type: str | None, description: str | None, timeout: int, model: str):
     """Background task to solve challenge."""
     session = sessions[session_id]
     session.status = ChallengeStatus.RUNNING
@@ -333,7 +341,9 @@ async def solve_challenge_background_form(session_id: str, url: str, flag_format
             pass
         actions = await ai_agent.solve_challenge(
             session_id=session_id,
-            challenge_url=str(url),
+            challenge_url=str(url) if url else None,
+            socket_host=host,
+            socket_port=port,
             flag_format=flag_format,
             challenge_type=challenge_type,  # type: ignore[arg-type]
             description=description,
