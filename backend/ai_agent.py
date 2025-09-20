@@ -9,8 +9,13 @@ from openai import AsyncOpenAI
 
 from .models import AgentAction, ChallengeType
 from .docker_manager import DockerManager
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
+
+class SingleCommand(BaseModel):
+    command: str
+    reasoning: str
 
 
 class CTFAgent:
@@ -414,53 +419,47 @@ class CTFAgent:
             user_block = f"User request:\n{prompt}"
             input_text = "\n\n".join(context_blocks + [user_block]) if context_blocks else user_block
 
-            # Call Responses API with JSON schema for a single command, fallback to chat.completions if needed
+            # Call Responses API with structured output (SingleCommand)
             try:
-                response = await self.client.responses.create(
+                response = await self.client.responses.parse(
                     model=self.model,
-                    system=self._get_system_prompt(),
-                    input=input_text,
+                    instructions=self._get_system_prompt(),
+                    input=[
+                        {"role": "user", "content": input_text}
+                    ],
                     max_output_tokens=10000,
                     reasoning={"effort": "medium"},
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "SingleCommand",
-                            "strict": True,
-                            "schema": {
-                                "type": "object",
-                                "properties": {
-                                    "command": {"type": "string"},
-                                    "reasoning": {"type": "string"}
-                                },
-                                "required": ["command"],
-                                "additionalProperties": False
-                            }
-                        }
-                    }
+                    text_format=SingleCommand
                 )
                 # Track usage for Responses API
                 self._update_usage_from_response(session_id, response)
                 use_responses_api = True
             except Exception as e:
-                logger.warning(f"Responses API call failed, falling back to chat.completions: {e}")
-                messages = [
-                    {"role": "system", "content": self._get_system_prompt()},
-                    {"role": "user", "content": input_text}
-                ]
-                response = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    max_completion_tokens=10000,
-                    reasoning_effort="medium"
+                logger.error(f"Responses API call failed: {e}")
+                error_action = AgentAction(
+                    timestamp=datetime.now(timezone.utc),
+                    action_type="ai_error",
+                    output=f"Responses API call failed: {e}",
+                    reasoning="Structured output call failed",
+                    success=False
                 )
-                # Track usage for Chat Completions
-                self._update_usage_from_response(session_id, response)
-                use_responses_api = False
+                actions.append(error_action)
+                if callback:
+                    await callback("action", error_action.dict())
+                return actions
 
-            # Extract output text
+            # Extract output text or structured parse
             if use_responses_api:
-                ai_response = getattr(response, "output_text", None)
+                ai_response = None
+                try:
+                    sc = getattr(response, "output_parsed", None)
+                    if sc is not None and getattr(sc, "command", None):
+                        ai_response = json.dumps({
+                            "command": sc.command,
+                            "reasoning": getattr(sc, "reasoning", "") or "No reasoning provided"
+                        })
+                except Exception:
+                    ai_response = None
                 if ai_response is None:
                     try:
                         parts: List[str] = []
@@ -532,52 +531,33 @@ class CTFAgent:
 """
                 
                 try:
+                    followup_response = await self.client.responses.parse(
+                        model=self.model,
+                        instructions="You are a CTF expert. Provide a SINGLE shell command in JSON object format only.",
+                        input=[
+                            {"role": "user", "content": followup_prompt}
+                        ],
+                        max_output_tokens=10000,
+                        reasoning={"effort": "medium"},
+                        text_format=SingleCommand
+                    )
+                    self._update_usage_from_response(session_id, followup_response)
+                    followup_text = getattr(followup_response, "output_text", "") or ""
                     try:
-                        followup_response = await self.client.responses.create(
-                            model=self.model,
-                            system="You are a CTF expert. Provide a SINGLE shell command in JSON object format only.",
-                            input=followup_prompt,
-                            max_output_tokens=500,
-                            reasoning={"effort": "medium"},
-                            response_format={
-                                "type": "json_schema",
-                                "json_schema": {
-                                    "name": "SingleCommand",
-                                    "strict": True,
-                                    "schema": {
-                                        "type": "object",
-                                        "properties": {
-                                            "command": {"type": "string"},
-                                            "reasoning": {"type": "string"}
-                                        },
-                                        "required": ["command"],
-                                        "additionalProperties": False
-                                    }
-                                }
-                            }
-                        )
-                        self._update_usage_from_response(session_id, followup_response)
-                        followup_text = getattr(followup_response, "output_text", "") or ""
-                    except Exception as e2:
-                        logger.warning(f"Responses API follow-up failed, falling back: {e2}")
-                        followup_cc = await self.client.chat.completions.create(
-                            model=self.model,
-                            messages=[
-                                {"role": "system", "content": "You are a CTF expert. Provide a SINGLE shell command in JSON object format only."},
-                                {"role": "user", "content": followup_prompt}
-                            ],
-                            max_completion_tokens=500,
-                            reasoning_effort="medium"
-                        )
-                        self._update_usage_from_response(session_id, followup_cc)
-                        followup_text = followup_cc.choices[0].message.content
-                    try:
-                        parsed_fu = json.loads(followup_text)
-                        if isinstance(parsed_fu, dict) and parsed_fu.get("command"):
+                        # Prefer structured parse from Responses.parse
+                        sc_fu = getattr(followup_response, "output_parsed", None)
+                        if sc_fu is not None and getattr(sc_fu, "command", None):
                             commands = [{
-                                "command": str(parsed_fu.get("command", "")).strip(),
-                                "reasoning": str(parsed_fu.get("reasoning", "")).strip() or "No reasoning provided"
+                                "command": str(sc_fu.command or "").strip(),
+                                "reasoning": str(getattr(sc_fu, "reasoning", "") or "No reasoning provided").strip()
                             }]
+                        else:
+                            parsed_fu = json.loads(followup_text)
+                            if isinstance(parsed_fu, dict) and parsed_fu.get("command"):
+                                commands = [{
+                                    "command": str(parsed_fu.get("command", "")).strip(),
+                                    "reasoning": str(parsed_fu.get("reasoning", "")).strip() or "No reasoning provided"
+                                }]
                     except Exception:
                         commands = self._parse_ai_response(followup_text)[:1]
                     if commands:
