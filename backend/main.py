@@ -53,6 +53,8 @@ app.mount("/static", StaticFiles(directory="backend/static"), name="static")
 # Global state
 sessions: Dict[str, ChallengeSession] = {}
 websocket_connections: Dict[str, WebSocket] = {}
+# Track background tasks by session for cancellation
+background_tasks: Dict[str, asyncio.Task] = {}
 
 # Initialize AI agent
 try:
@@ -163,7 +165,9 @@ async def start_challenge(
                 logger.error(f"Failed to save handout {file.filename}: {e}")
 
     # Start solving in background
-    asyncio.create_task(solve_challenge_background_form(session_id, url, host, port, flag_format, challenge_type, description, timeout, model))
+    # Start and track background solving task for later cancellation
+    task = asyncio.create_task(solve_challenge_background_form(session_id, url, host, port, flag_format, challenge_type, description, timeout, model))
+    background_tasks[session_id] = task
     
     return {"session_id": session_id, "status": "started"}
 
@@ -235,14 +239,25 @@ async def stop_challenge(session_id: str):
     
     session = sessions[session_id]
     if session.status == ChallengeStatus.RUNNING:
-        # Clean up container
-        if session.container_id:
+        # Cancel background task if running
+        task = background_tasks.get(session_id)
+        if task and not task.done():
+            task.cancel()
             try:
-                if ai_agent:
-                    await ai_agent.docker_manager.cleanup_container(session_id)
+                await task
+            except asyncio.CancelledError:
+                logger.info(f"Background task for session {session_id} cancelled successfully")
             except Exception as e:
-                logger.error(f"Failed to cleanup container for session {session_id}: {e}")
-        
+                logger.warning(f"Background task for session {session_id} finished with error during cancel: {e}")
+        background_tasks.pop(session_id, None)
+
+        # Optionally attempt cleanup immediately (background finally also cleans up)
+        try:
+            if ai_agent:
+                await ai_agent.docker_manager.cleanup_container(session_id)
+        except Exception as e:
+            logger.error(f"Failed to cleanup container for session {session_id}: {e}")
+
         session.status = ChallengeStatus.FAILED
         session.updated_at = datetime.now(timezone.utc)
         session.error_message = "Stopped by user"
@@ -256,6 +271,18 @@ async def delete_challenge(session_id: str):
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     
+    # Cancel any running background task
+    task = background_tasks.get(session_id)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            logger.info(f"Background task for session {session_id} cancelled (delete)")
+        except Exception as e:
+            logger.warning(f"Background task for session {session_id} error on delete: {e}")
+    background_tasks.pop(session_id, None)
+
     # Clean up container if exists
     session = sessions[session_id]
     if session.container_id:
@@ -365,6 +392,28 @@ async def solve_challenge_background_form(session_id: str, url: str | None, host
             session.status = ChallengeStatus.FAILED
             session.error_message = "Flag not found within time limit"
         
+    except asyncio.CancelledError:
+        logger.info(f"Background solving cancelled for session {session_id}")
+        session.status = ChallengeStatus.FAILED
+        session.error_message = "Stopped by user"
+        session.updated_at = datetime.now(timezone.utc)
+        # Attempt cleanup
+        try:
+            if ai_agent:
+                await ai_agent.docker_manager.cleanup_container(session_id)
+        except Exception as e:
+            logger.error(f"Failed to cleanup container after cancel for session {session_id}: {e}")
+        # Inform frontend via WebSocket
+        try:
+            cancel_message = WebSocketMessage(
+                type="status",
+                session_id=session_id,
+                data={"status": session.status, "error": session.error_message}
+            )
+            await websocket_manager.send_message(session_id, cancel_message)
+        except Exception:
+            pass
+        raise
     except Exception as e:
         logger.error(f"Challenge solving failed for session {session_id}: {e}")
         session.status = ChallengeStatus.FAILED
@@ -386,6 +435,8 @@ async def solve_challenge_background_form(session_id: str, url: str | None, host
                 await ai_agent.docker_manager.cleanup_container(session_id)
         except Exception as e:
             logger.error(f"Failed to cleanup container for session {session_id}: {e}")
+        # Remove task from registry if present
+        background_tasks.pop(session_id, None)
 
 
 if __name__ == "__main__":

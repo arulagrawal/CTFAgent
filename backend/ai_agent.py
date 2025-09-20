@@ -223,6 +223,9 @@ class CTFAgent:
             
             return actions
             
+        except asyncio.CancelledError:
+            # Propagate cancellation so the background task can handle it
+            raise
         except Exception as e:
             error_action = AgentAction(
                 timestamp=datetime.now(timezone.utc),
@@ -303,7 +306,7 @@ class CTFAgent:
                 response = await self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    max_completion_tokens=4000,
+                    max_completion_tokens=10000,
                     reasoning_effort="medium"
                 )
                 use_responses_api = False
@@ -532,6 +535,9 @@ class CTFAgent:
                 # Small delay to prevent overwhelming
                 await asyncio.sleep(0.5)
         
+        except asyncio.CancelledError:
+            # Propagate cancellation to stop immediately
+            raise
         except Exception as e:
             error_action = AgentAction(
                 timestamp=datetime.now(timezone.utc),
