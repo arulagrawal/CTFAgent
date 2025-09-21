@@ -464,34 +464,8 @@ class CTFAgent:
         actions = []
 
         try:
-            # Build consolidated input for Responses API (single-step)
-            context_blocks = []
-            if len(previous_actions) > 0:
-                recent_context = "Previous session context:\n"
-                for action in previous_actions:
-                    if action.command:
-                        recent_context += f"Executed: {action.command}\n"
-                        if action.output and len(action.output.strip()) > 0:
-                            # Extract and include FULL STDOUT (not truncated)
-                            stdout_match = re.search(
-                                r"STDOUT:\n(.*?)(?:\n\nSTDERR:|$)",
-                                action.output,
-                                re.DOTALL,
-                            )
-                            if stdout_match:
-                                stdout_content = stdout_match.group(1)
-                                recent_context += f"STDOUT (full):\n{stdout_content}\n"
-                            else:
-                                # Fallback: include full recorded output
-                                recent_context += f"Output (full):\n{action.output}\n"
-                context_blocks.append(recent_context)
-
-            user_block = f"User request:\n{prompt}"
-            input_text = (
-                "\n\n".join(context_blocks + [user_block])
-                if context_blocks
-                else user_block
-            )
+            # Use the provided prompt directly; it already contains any needed history
+            input_text = str(prompt)
 
             # Call Responses API with structured output (SingleCommand)
             try:
@@ -618,7 +592,6 @@ class CTFAgent:
                     self._update_usage_from_response(session_id, followup_response)
                     followup_text = getattr(followup_response, "output_text", "") or ""
                     try:
-                        # Prefer structured parse from Responses.parse
                         sc_fu = getattr(followup_response, "output_parsed", None)
                         if sc_fu is not None and getattr(sc_fu, "command", None):
                             commands = [
@@ -903,13 +876,29 @@ Start analyzing this challenge to find the flag. Propose exactly ONE command as 
                     if stdout_match:
                         stdout_content = stdout_match.group(1).strip()
                         if stdout_content and len(stdout_content) > 0:
-                            # Keep more output for better context
-                            if len(stdout_content) > 500:
-                                output_preview = stdout_content[:500] + "..."
-                            else:
-                                output_preview = stdout_content
-                            context += f"  → {output_preview}\n"
-                    elif not action.success:
+                            context += f"  → {stdout_content}\n"
+                    # Extract EXIT CODE and STDERR preview to give failure context
+                    try:
+                        exit_match = re.search(r"EXIT CODE:\s*(\d+)", action.output)
+                        if exit_match and exit_match.group(1) != "0":
+                            context += f"  → exit={exit_match.group(1)}\n"
+
+                        stderr_match = re.search(r"STDERR:\n(.*)", action.output, re.DOTALL)
+                        if stderr_match:
+                            stderr_content = stderr_match.group(1).strip()
+                            if stderr_content:
+                                PREVIEW_LIMIT = 800
+                                if len(stderr_content) > PREVIEW_LIMIT:
+                                    head = stderr_content[: PREVIEW_LIMIT // 2]
+                                    tail = stderr_content[-(PREVIEW_LIMIT // 2) :]
+                                    stderr_preview = f"{head}\n...\n{tail}"
+                                else:
+                                    stderr_preview = stderr_content
+                                context += f"  → STDERR: {stderr_preview}\n"
+                    except Exception:
+                        pass
+                else:
+                    if not action.success:
                         context += f"  → Failed\n"
                 context += "\n"
 
@@ -952,7 +941,7 @@ Start analyzing this challenge to find the flag. Propose exactly ONE command as 
 Flag format: {flag_format}
 
 {files_block}
-Continue working toward finding the flag. {guidance} Propose exactly ONE next shell command with a short reasoning. If you just read a local file, avoid reprinting it fully; summarize and move on. Return only a single JSON object with keys command and reasoning."""
+Continue working toward finding the flag. {guidance} Propose exactly ONE next shell command with a short reasoning. If you just read a local file, avoid reprinting it fully; summarize and move on."""
 
     def _parse_ai_response(self, response: str) -> List[Dict[str, str]]:
         """Parse AI response to extract commands with improved error handling."""
