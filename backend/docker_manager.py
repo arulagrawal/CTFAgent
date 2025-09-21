@@ -119,7 +119,6 @@ class DockerManager:
                 workdir="/workspace",
             )
 
-            pprint(exec_result)
 
             stdout = (
                 exec_result.output[0].decode("utf-8") if exec_result.output[0] else ""
@@ -243,6 +242,42 @@ class DockerManager:
                 )
             finally:
                 del self.containers[session_id]
+
+    async def kill_container(self, session_id: str, remove: bool = True):
+        """Immediately kill a running container (SIGKILL) and optionally remove it.
+
+        This is intended for hard-stop scenarios (e.g., user pressed Stop) where
+        we cannot wait for graceful shutdown or long-running execs to finish.
+        """
+        if session_id not in self.containers:
+            return
+
+        container = self.containers[session_id]
+        try:
+            try:
+                container.kill()  # SIGKILL for immediate stop
+                logger.info(f"Killed container for session {session_id}")
+            except Exception as e:
+                logger.warning(
+                    f"Failed to kill container for session {session_id}: {e}"
+                )
+
+            if remove:
+                try:
+                    container.remove(force=True)
+                    logger.info(
+                        f"Removed container after kill for session {session_id}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to remove container after kill for session {session_id}: {e}"
+                    )
+        finally:
+            # Ensure we drop reference regardless of success
+            try:
+                del self.containers[session_id]
+            except Exception:
+                pass
 
     def get_container_logs(self, session_id: str, tail: int = 100) -> str:
         """Get container logs."""

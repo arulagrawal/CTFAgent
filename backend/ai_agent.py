@@ -14,6 +14,10 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 
+# Substrings that invalidate a matched flag candidate (case-insensitive)
+FLAG_CANDIDATE_BANNED_SUBSTRINGS = ("fake", "redacted")
+
+
 class SingleCommand(BaseModel):
     command: str
     reasoning: str
@@ -22,7 +26,7 @@ class SingleCommand(BaseModel):
 class CTFAgent:
     def __init__(self, openai_api_key: str, model: str = "gpt-5-mini"):
         self.client = AsyncOpenAI(api_key=openai_api_key)
-        self.model = model  # Using gpt-5-mini (the latest GPT-5 small model)
+        self.model = model
         self.docker_manager = DockerManager()
         self._ensured_handout_dir: Dict[str, bool] = {}
         self._session_handouts: Dict[str, List[str]] = {}
@@ -545,7 +549,6 @@ class CTFAgent:
                     ai_response = ""
 
             logger.info(f"AI Responses output length: {len(ai_response or '')}")
-            logger.debug(f"AI Response Content: {repr((ai_response or '')[:1000])}")
 
             if not ai_response or ai_response.strip() == "":
                 logger.warning("AI returned empty response from Responses API")
@@ -579,7 +582,7 @@ class CTFAgent:
             # If no commands were parsed, log the full AI response for debugging
             if not commands:
                 logger.warning(
-                    f"No commands extracted from AI response. Full response: {ai_response}"
+                    f"No commands extracted from AI response (length={len(ai_response or '')})."
                 )
 
                 # Create a more informative action with the full AI response
@@ -1333,7 +1336,10 @@ Continue working toward finding the flag. {guidance} Propose exactly ONE next sh
                     ):
                         for match in pattern.finditer(stdout_content):
                             candidate = match.group(0)
-                            if "fake" not in candidate.lower():
+                            if all(
+                                banned not in candidate.lower()
+                                for banned in FLAG_CANDIDATE_BANNED_SUBSTRINGS
+                            ):
                                 return candidate
                 else:
                     # Fallback: search full output but exclude command lines and metadata
@@ -1364,7 +1370,10 @@ Continue working toward finding the flag. {guidance} Propose exactly ONE next sh
                     ):
                         for match in pattern.finditer(content):
                             candidate = match.group(0)
-                            if "fake" not in candidate.lower():
+                            if all(
+                                banned not in candidate.lower()
+                                for banned in FLAG_CANDIDATE_BANNED_SUBSTRINGS
+                            ):
                                 return candidate
 
         return None

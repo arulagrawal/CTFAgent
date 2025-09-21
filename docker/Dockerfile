@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y \
     # Cryptography tools
     openssl hashcat john \
     # Reverse engineering tools
-     binutils  \
+    binutils  \
     # Forensics tools
     binwalk foremost\
     # Steganography tools
@@ -38,7 +38,7 @@ RUN apt-get update && apt-get install -y \
     # && rm -rf /var/lib/apt/lists/*
 
 # Install Python packages commonly used in CTFs
-RUN pip3 install --no-cache-dir \
+RUN pip3 install --no-cache-dir --break-system-packages \
     requests beautifulsoup4 \
     pycryptodome cryptography \
     pillow \
@@ -48,10 +48,10 @@ RUN pip3 install --no-cache-dir \
     paramiko \
     sqlparse \
     lxml \
-    numpy scipy \
-    jupyter \
-    angr \
-    capstone 
+    numpy scipy
+    # jupyter \
+    # angr \
+    # capstone 
 
 # # Install additional tools via pip
 # RUN pip3 install --no-cache-dir \

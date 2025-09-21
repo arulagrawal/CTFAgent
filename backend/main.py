@@ -269,32 +269,38 @@ async def stop_challenge(session_id: str):
 
     session = sessions[session_id]
     if session.status == ChallengeStatus.RUNNING:
-        # Cancel background task if running
-        task = background_tasks.get(session_id)
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                logger.info(
-                    f"Background task for session {session_id} cancelled successfully"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Background task for session {session_id} finished with error during cancel: {e}"
-                )
-        background_tasks.pop(session_id, None)
-
-        # Optionally attempt cleanup immediately (background finally also cleans up)
+        # 1) Hard-kill the container immediately (non-blocking)
         try:
             if ai_agent:
-                await ai_agent.docker_manager.cleanup_container(session_id)
+                asyncio.create_task(
+                    ai_agent.docker_manager.kill_container(session_id)
+                )
         except Exception as e:
-            logger.error(f"Failed to cleanup container for session {session_id}: {e}")
+            logger.warning(
+                f"Failed to schedule container kill for session {session_id}: {e}"
+            )
 
+        # 2) Update session state immediately
         session.status = ChallengeStatus.FAILED
         session.updated_at = datetime.now(timezone.utc)
         session.error_message = "Stopped by user"
+
+        # 3) Notify frontend right away
+        try:
+            cancel_message = WebSocketMessage(
+                type="status",
+                session_id=session_id,
+                data={"status": session.status, "error": session.error_message},
+            )
+            await websocket_manager.send_message(session_id, cancel_message)
+        except Exception as e:
+            logger.debug(f"WebSocket notify on stop failed for {session_id}: {e}")
+
+        # 4) Cancel background task but do not await (avoid blocking on long exec)
+        task = background_tasks.get(session_id)
+        if task and not task.done():
+            task.cancel()
+        background_tasks.pop(session_id, None)
 
     return {"status": "stopped"}
 
