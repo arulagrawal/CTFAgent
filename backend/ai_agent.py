@@ -32,6 +32,8 @@ class CTFAgent:
         self._session_handouts: Dict[str, List[str]] = {}
         # Track OpenAI usage per session
         self._session_usage: Dict[str, Dict[str, Any]] = {}
+        # Track last Responses API response.id per session for conversation state
+        self._session_last_response_id: Dict[str, Optional[str]] = {}
 
     def _init_usage(self, session_id: str) -> None:
         self._session_usage[session_id] = {
@@ -308,6 +310,8 @@ class CTFAgent:
         try:
             # Initialize usage tracking
             self._init_usage(session_id)
+            # Reset conversation state
+            self._session_last_response_id[session_id] = None
             # Create container
             await self.docker_manager.create_container(session_id)
             # Ensure handouts dir exists
@@ -467,8 +471,12 @@ class CTFAgent:
             # Use the provided prompt directly; it already contains any needed history
             input_text = str(prompt)
 
-            # Call Responses API with structured output (SingleCommand)
+            # Call Responses API with structured output (SingleCommand) and conversation state
             try:
+                prev_id = self._session_last_response_id.get(session_id)
+                _kwargs = {}
+                if prev_id:
+                    _kwargs["previous_response_id"] = prev_id
                 response = await self.client.responses.parse(
                     model=self.model,
                     instructions=self._get_system_prompt(),
@@ -476,9 +484,15 @@ class CTFAgent:
                     max_output_tokens=10000,
                     reasoning={"effort": "medium"},
                     text_format=SingleCommand,
+                    **_kwargs,
                 )
                 # Track usage for Responses API
                 self._update_usage_from_response(session_id, response)
+                # Update last response id for conversation continuation
+                try:
+                    self._session_last_response_id[session_id] = getattr(response, "id", None)
+                except Exception:
+                    pass
             except Exception as e:
                 logger.error(f"Responses API call failed: {e}")
                 error_action = AgentAction(
@@ -795,46 +809,52 @@ Start analyzing this challenge to find the flag. Propose exactly ONE shell comma
         """Build prompt for iterative solving tailored to URL/socket/handout-only."""
         import re  # For regex operations
 
-        # Give ALL history - no limits so GPT has complete context
-        recent_actions = actions
-
-        context = "Previous work:\n"
-        for action in recent_actions:
-            if action.command:
-                context += f"• {action.command}\n"
-                if action.output:
-                    # Extract STDOUT content
-                    stdout_match = re.search(
-                        r"STDOUT:\n(.*?)(?:\n\nSTDERR:|$)", action.output, re.DOTALL
-                    )
-                    if stdout_match:
-                        stdout_content = stdout_match.group(1).strip()
-                        if stdout_content and len(stdout_content) > 0:
-                            context += f"  → {stdout_content}\n"
-                    # Extract EXIT CODE and STDERR preview to give failure context
-                    try:
-                        exit_match = re.search(r"EXIT CODE:\s*(\d+)", action.output)
-                        if exit_match and exit_match.group(1) != "0":
-                            context += f"  → exit={exit_match.group(1)}\n"
-
-                        stderr_match = re.search(r"STDERR:\n(.*)", action.output, re.DOTALL)
-                        if stderr_match:
-                            stderr_content = stderr_match.group(1).strip()
-                            if stderr_content:
-                                PREVIEW_LIMIT = 800
-                                if len(stderr_content) > PREVIEW_LIMIT:
-                                    head = stderr_content[: PREVIEW_LIMIT // 2]
-                                    tail = stderr_content[-(PREVIEW_LIMIT // 2) :]
-                                    stderr_preview = f"{head}\n...\n{tail}"
-                                else:
-                                    stderr_preview = stderr_content
-                                context += f"  → STDERR: {stderr_preview}\n"
-                    except Exception:
-                        pass
-                else:
-                    if not action.success:
-                        context += f"  → Failed\n"
-                context += "\n"
+        # Summarize only the most recent command result to keep tokens low
+        recent_block = ""
+        try:
+            last = next((a for a in reversed(actions) if a.command), None)
+        except Exception:
+            last = None
+        if last:
+            recent_block = "Previous result:\n"
+            recent_block += f"• {last.command}\n"
+            if last.output:
+                # Extract STDOUT
+                stdout_match = re.search(
+                    r"STDOUT:\n(.*?)(?:\n\nSTDERR:|$)", last.output, re.DOTALL
+                )
+                if stdout_match:
+                    stdout_content = stdout_match.group(1).strip()
+                    if stdout_content:
+                        stdout_preview = stdout_content
+                        recent_block += f"  → {stdout_preview}\n"
+                # Exit code
+                try:
+                    exit_match = re.search(r"EXIT CODE:\s*(\d+)", last.output)
+                    if exit_match and exit_match.group(1) != "0":
+                        recent_block += f"  → exit={exit_match.group(1)}\n"
+                except Exception:
+                    pass
+                # STDERR
+                try:
+                    stderr_match = re.search(r"STDERR:\n(.*)", last.output, re.DOTALL)
+                    if stderr_match:
+                        stderr_content = stderr_match.group(1).strip()
+                        if stderr_content:
+                            PREVIEW_LIMIT = 600
+                            if len(stderr_content) > PREVIEW_LIMIT:
+                                head = stderr_content[: PREVIEW_LIMIT // 2]
+                                tail = stderr_content[-(PREVIEW_LIMIT // 2) :]
+                                stderr_preview = f"{head}\n...\n{tail}"
+                            else:
+                                stderr_preview = stderr_content
+                            recent_block += f"  → STDERR: {stderr_preview}\n"
+                except Exception:
+                    pass
+            else:
+                if not last.success:
+                    recent_block += "  → Failed\n"
+            recent_block += "\n"
 
         files_block = ""
         if uploaded_files:
@@ -870,7 +890,7 @@ Start analyzing this challenge to find the flag. Propose exactly ONE shell comma
             guidance_lines.append(self._get_pyjail_guidance())
         guidance = " ".join(guidance_lines)
 
-        return f"""{context}
+        return f"""{recent_block}
 {chr(10).join(target_block)}
 Flag format: {flag_format}
 
