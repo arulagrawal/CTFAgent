@@ -119,7 +119,6 @@ class DockerManager:
                 workdir="/workspace",
             )
 
-
             stdout = (
                 exec_result.output[0].decode("utf-8") if exec_result.output[0] else ""
             )

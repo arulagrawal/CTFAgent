@@ -58,20 +58,15 @@ class CTFAgent:
             )
             usage = getattr(response, "usage", None)
             if not usage:
-                # Try alternative locations/shapes
-                usage = getattr(getattr(response, "choices", [{}])[0], "usage", None)
-            if not usage:
                 return
-            # Handle both Responses API and Chat Completions shapes
-            input_tokens = getattr(usage, "input_tokens", None)
-            if input_tokens is None:
-                input_tokens = getattr(usage, "prompt_tokens", 0)
-            output_tokens = getattr(usage, "output_tokens", None)
-            if output_tokens is None:
-                output_tokens = getattr(usage, "completion_tokens", 0)
-            total_tokens = getattr(usage, "total_tokens", None)
-            if total_tokens is None:
-                total_tokens = (input_tokens or 0) + (output_tokens or 0)
+            # Responses API usage fields
+            input_tokens = getattr(usage, "input_tokens", 0)
+            output_tokens = getattr(usage, "output_tokens", 0)
+            total_tokens = getattr(
+                usage,
+                "total_tokens",
+                (input_tokens or 0) + (output_tokens or 0),
+            )
 
             stats["requests"] += 1
             stats["input_tokens"] += int(input_tokens or 0)
@@ -304,7 +299,9 @@ class CTFAgent:
             # Set per-session reasoning effort (default low)
             try:
                 self._reasoning_effort = (
-                    str(reasoning_effort).lower() if reasoning_effort in ("low", "medium") else "low"
+                    str(reasoning_effort).lower()
+                    if reasoning_effort in ("low", "medium")
+                    else "low"
                 )
             except Exception:
                 self._reasoning_effort = "low"
@@ -484,11 +481,14 @@ class CTFAgent:
                     text_format=SingleCommand,
                     **_kwargs,
                 )
+
                 # Track usage for Responses API
                 self._update_usage_from_response(session_id, response)
                 # Update last response id for conversation continuation
                 try:
-                    self._session_last_response_id[session_id] = getattr(response, "id", None)
+                    self._session_last_response_id[session_id] = getattr(
+                        response, "id", None
+                    )
                 except Exception:
                     pass
             except Exception as e:
@@ -505,43 +505,27 @@ class CTFAgent:
                     await callback("action", error_action.dict())
                 return actions
 
-            # Extract output text or structured parse
-            ai_response = None
+            # Use structured output directly (SingleCommand)
             try:
                 sc = getattr(response, "output_parsed", None)
-                if sc is not None and getattr(sc, "command", None):
-                    ai_response = json.dumps(
-                        {
-                            "command": sc.command,
-                            "reasoning": getattr(sc, "reasoning", "")
-                            or "No reasoning provided",
-                        }
-                    )
             except Exception:
-                ai_response = None
-            if ai_response is None:
-                try:
-                    parts: List[str] = []
-                    for out in getattr(response, "output", []) or []:
-                        for content in getattr(out, "content", []) or []:
-                            if getattr(content, "type", None) in (
-                                "output_text",
-                                "text",
-                            ) and getattr(content, "text", None):
-                                parts.append(content.text)
-                    ai_response = "\n".join(parts)
-                except Exception:
-                    ai_response = ""
+                sc = None
 
-            logger.info(f"AI Responses output length: {len(ai_response or '')}")
-
-            if not ai_response or ai_response.strip() == "":
-                logger.warning("AI returned empty response from Responses API")
+            if (
+                sc is None
+                or not getattr(sc, "command", None)
+                or not str(getattr(sc, "command", "")).strip()
+            ):
+                logger.warning("AI returned empty structured command from Responses API")
                 error_action = AgentAction(
                     timestamp=datetime.now(timezone.utc),
                     action_type="ai_empty_response",
                     output="AI returned empty response using Responses API",
-                    reasoning="AI hit token limits or returned empty content",
+                    reasoning=(
+                        response.incomplete_details.reason
+                        if response.incomplete_details
+                        else f"No reasoning provided. Token usage: {response.usage.total_tokens if response.usage else 'unknown'}"
+                    ),
                     success=False,
                 )
                 actions.append(error_action)
@@ -549,61 +533,25 @@ class CTFAgent:
                     await callback("action", error_action.dict())
                 return actions
 
-            # Parse AI response for a single command (prefer strict JSON)
-            try:
-                parsed = json.loads(ai_response)
-                commands = []
-                if isinstance(parsed, dict) and parsed.get("command"):
-                    commands = [
-                        {
-                            "command": str(parsed.get("command", "")).strip(),
-                            "reasoning": str(parsed.get("reasoning", "")).strip()
-                            or "No reasoning provided",
-                        }
-                    ]
-            except Exception:
-                pass
+            command = str(getattr(sc, "command", "")).strip()
+            reasoning = (
+                str(getattr(sc, "reasoning", "")).strip() or "No reasoning provided"
+            )
 
-            # If no commands were parsed, log the full AI response for debugging
-            if not commands:
+            # Validate command doesn't contain clear JSON key artifacts
+            if any(
+                artifact in command for artifact in ['"command":', '"reasoning":']
+            ):
                 logger.warning(
-                    f"No commands extracted from AI response (length={len(ai_response or '')})."
+                    f"Skipping malformed command that still includes JSON keys: {command}"
                 )
+                return actions
 
-                # Create a more informative action with the full AI response
-                error_action = AgentAction(
-                    timestamp=datetime.now(timezone.utc),
-                    action_type="ai_response_parsing_failed",
-                    output=f"AI provided response but no commands could be extracted.\n\nFull AI Response:\n{ai_response}",
-                    reasoning="The AI responded but the response format didn't match expected patterns for command extraction",
-                    success=False,
-                )
-                actions.append(error_action)
-                if callback:
-                    await callback("action", error_action.dict())
+            # Clean up any remaining quotes or artifacts (but preserve quotes inside the command)
+            command = command.strip('"{}[]')
 
-            # Execute only one command per step
-            for command_data in commands[:1]:
-                command = command_data.get("command", "")
-                reasoning = command_data.get("reasoning", "")
-
-                if not command or not command.strip():
-                    continue
-
-                # Validate command doesn't contain clear JSON key artifacts
-                if any(
-                    artifact in command for artifact in ['"command":', '"reasoning":']
-                ):
-                    logger.warning(
-                        f"Skipping malformed command that still includes JSON keys: {command}"
-                    )
-                    continue
-
-                # Clean up any remaining quotes or artifacts (but preserve quotes inside the command)
-                command = command.strip('"{}[]')
-
-                if not command or len(command.strip()) == 0:
-                    continue
+            if not command or len(command.strip()) == 0:
+                return actions
 
                 # Execute command in container
                 result = await self.docker_manager.execute_command(session_id, command)
