@@ -132,6 +132,7 @@ async def start_challenge(
     description: str | None = Form(None),
     timeout: int = Form(300),
     model: str = Form("gpt-5-mini"),
+    reasoning_effort: str = Form("low"),
     handouts: List[UploadFile] | None = None,
 ):
     """Start a new CTF challenge solving session."""
@@ -191,6 +192,7 @@ async def start_challenge(
             description,
             timeout,
             model,
+            reasoning_effort,
         )
     )
     background_tasks[session_id] = task
@@ -367,6 +369,7 @@ async def solve_challenge_background_form(
     description: str | None,
     timeout: int,
     model: str,
+    reasoning_effort: str,
 ):
     """Background task to solve challenge."""
     session = sessions[session_id]
@@ -430,6 +433,7 @@ async def solve_challenge_background_form(
             description=description,
             uploaded_files=session.uploaded_files,
             callback=websocket_callback,
+            reasoning_effort=reasoning_effort,
         )
 
         # Update session with results

@@ -277,16 +277,6 @@ class CTFAgent:
                         f"Exit Code: {container.attrs['State']['ExitCode']}"
                     )
 
-            # Check network connectivity
-            try:
-                test_result = container.exec_run("ping -c 1 8.8.8.8")
-                if test_result.exit_code != 0:
-                    status_info.append("Network: No internet connectivity")
-                else:
-                    status_info.append("Network: Internet accessible")
-            except Exception:
-                status_info.append("Network: Unable to test connectivity")
-
             return " | ".join(status_info)
 
         except Exception as e:
@@ -303,6 +293,7 @@ class CTFAgent:
         description: Optional[str] = None,
         uploaded_files: Optional[List[str]] = None,
         callback: Optional[Callable] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> List[AgentAction]:
         """Main method to solve a CTF challenge."""
         actions = []
@@ -310,6 +301,13 @@ class CTFAgent:
         try:
             # Initialize usage tracking
             self._init_usage(session_id)
+            # Set per-session reasoning effort (default low)
+            try:
+                self._reasoning_effort = (
+                    str(reasoning_effort).lower() if reasoning_effort in ("low", "medium") else "low"
+                )
+            except Exception:
+                self._reasoning_effort = "low"
             # Reset conversation state
             self._session_last_response_id[session_id] = None
             # Create container
@@ -382,7 +380,7 @@ class CTFAgent:
             actions.extend(analysis_actions)
 
             # Iterative solving process (strict one-by-one)
-            max_iterations = 20
+            max_iterations = 50
             for i in range(max_iterations):
                 # Check if flag found
                 flag = self._check_for_flag(actions, flag_format)
@@ -482,7 +480,7 @@ class CTFAgent:
                     instructions=self._get_system_prompt(),
                     input=[{"role": "user", "content": input_text}],
                     max_output_tokens=10000,
-                    reasoning={"effort": "medium"},
+                    reasoning={"effort": getattr(self, "_reasoning_effort", "low")},
                     text_format=SingleCommand,
                     **_kwargs,
                 )
@@ -603,37 +601,6 @@ class CTFAgent:
 
                 # Clean up any remaining quotes or artifacts (but preserve quotes inside the command)
                 command = command.strip('"{}[]')
-
-                # Replace placeholder targets with actual values when present in prompt
-                # URL replacement
-                if "TARGET_URL" in command or "TARGET_IP" in command:
-                    actual_url_match = re.search(r"Target URL:\s*(\S+)", prompt)
-                    if actual_url_match:
-                        actual_url = actual_url_match.group(1)
-                        command = command.replace("TARGET_URL", actual_url)
-                        command = command.replace("TARGET_IP", actual_url)
-                        logger.info(f"Replaced placeholder with actual URL: {command}")
-
-                # Socket replacement
-                if "TARGET_HOST" in command or "TARGET_PORT" in command:
-                    host_match = re.search(r"Target SOCKET:\s*([^:\s]+):(\d+)", prompt)
-                    if host_match:
-                        actual_host = host_match.group(1)
-                        actual_port = host_match.group(2)
-                        command = command.replace("TARGET_HOST", actual_host)
-                        command = command.replace("TARGET_PORT", actual_port)
-                        logger.info(
-                            f"Replaced placeholders with actual socket: {command}"
-                        )
-
-                # If command is reading a full file, encourage using cat (less confusion on output)
-                if re.search(r"sed\s+-n\s+'1,\d+p'\s+\S+", command):
-                    # Replace with cat for clarity
-                    file_match = re.search(r"sed\s+-n\s+'1,\d+p'\s+(\S+)", command)
-                    if file_match:
-                        file_path = file_match.group(1)
-                        command = f"cat {file_path}"
-                        logger.info(f"Rewrote sed full-file read to cat: {command}")
 
                 if not command or len(command.strip()) == 0:
                     continue
