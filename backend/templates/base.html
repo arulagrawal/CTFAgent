@@ -34,7 +34,6 @@
             font-family: 'Courier New', monospace;
         }
         .action-log {
-            max-height: 500px;
             overflow-y: auto;
         }
         .status-indicator {
@@ -50,10 +49,10 @@
         .status-pending { background-color: #f59e0b; }
     </style>
 </head>
-<body class="bg-gray-50 min-h-screen">
+<body class="bg-gray-50 min-h-screen flex flex-col">
     <!-- Header -->
     <header class="bg-white shadow-sm border-b">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div class="mx-auto px-2 sm:px-4" style="max-width: 95vw;">
             <div class="flex justify-between items-center py-4">
                 <div class="flex items-center">
                     <svg class="w-8 h-8 text-primary-600 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -81,7 +80,7 @@
         </div>
     </header>
 
-    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <main class="mx-auto px-2 sm:px-4 py-4 flex-1 flex flex-col" style="max-width: 95vw;">
         {% block content %}{% endblock %}
     </main>
 

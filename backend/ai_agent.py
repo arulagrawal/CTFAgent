@@ -203,44 +203,44 @@ class CTFAgent:
         actions: List[AgentAction],
     ) -> bool:
         """Heuristically detect if this looks like a Python jail/REPL challenge."""
-        try:
-            desc = (description or "").lower()
-            indicators = [
-                "pyjail",
-                "python jail",
-                "python repl",
-                "repl",
-                "sandbox",
-                "builtins",
-                "__import__",
-                ">>>",
-                "traceback",
-                "nameerror",
-                "pdb",
-            ]
-            if any(tok in desc for tok in indicators):
-                return True
-            for name in uploaded_files:
-                n = (name or "").lower()
-                if n.endswith(".py") or ("jail" in n and "py" in n):
-                    return True
-            # Look at recent outputs for Python prompts/errors
-            for action in actions[-5:]:
-                out = (action.output or "").lower()
-                if any(
-                    tok in out
-                    for tok in [
-                        ">>>",
-                        "traceback (most recent call last)",
-                        "nameerror",
-                        "attributeerror",
-                        "builtins",
-                        "pdb",
-                    ]
-                ):
-                    return True
-        except Exception:
-            pass
+        # try:
+        #     desc = (description or "").lower()
+        #     indicators = [
+        #         "pyjail",
+        #         "python jail",
+        #         "python repl",
+        #         "repl",
+        #         "sandbox",
+        #         "builtins",
+        #         "__import__",
+        #         ">>>",
+        #         "traceback",
+        #         "nameerror",
+        #         "pdb",
+        #     ]
+        #     if any(tok in desc for tok in indicators):
+        #         return True
+        #     for name in uploaded_files:
+        #         n = (name or "").lower()
+        #         if n.endswith(".py") or ("jail" in n and "py" in n):
+        #             return True
+        #     # Look at recent outputs for Python prompts/errors
+        #     for action in actions[-5:]:
+        #         out = (action.output or "").lower()
+        #         if any(
+        #             tok in out
+        #             for tok in [
+        #                 ">>>",
+        #                 "traceback (most recent call last)",
+        #                 "nameerror",
+        #                 "attributeerror",
+        #                 "builtins",
+        #                 "pdb",
+        #             ]
+        #         ):
+        #             return True
+        # except Exception:
+        #     pass
         return False
 
     def _get_pyjail_guidance(self) -> str:
@@ -390,7 +390,7 @@ class CTFAgent:
                     flag_action = AgentAction(
                         timestamp=datetime.now(timezone.utc),
                         action_type="flag_found",
-                        output=f"Flag found: {flag}",
+                        output=f"{flag}",
                         reasoning="Flag pattern matched in previous outputs",
                         success=True,
                     )
@@ -483,7 +483,7 @@ class CTFAgent:
                     model=self.model,
                     instructions=self._get_system_prompt(session_id),
                     input=[{"role": "user", "content": input_text}],
-                    max_output_tokens=10000,
+                    max_output_tokens=2**14,
                     reasoning={"effort": getattr(self, "_reasoning_effort", "low")},
                     text_format=SingleCommand,
                     service_tier="flex",
