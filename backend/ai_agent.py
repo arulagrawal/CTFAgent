@@ -34,6 +34,8 @@ class CTFAgent:
         self._session_usage: Dict[str, Dict[str, Any]] = {}
         # Track last Responses API response.id per session for conversation state
         self._session_last_response_id: Dict[str, Optional[str]] = {}
+        # Track challenge type per session for tailored prompts
+        self._session_challenge_type: Dict[str, Optional[ChallengeType]] = {}
 
     def _init_usage(self, session_id: str) -> None:
         self._session_usage[session_id] = {
@@ -296,6 +298,8 @@ class CTFAgent:
         try:
             # Initialize usage tracking
             self._init_usage(session_id)
+            # Store session challenge type for tailored prompts
+            self._session_challenge_type[session_id] = challenge_type
             # Set per-session reasoning effort (default low)
             try:
                 self._reasoning_effort = (
@@ -474,11 +478,12 @@ class CTFAgent:
                     _kwargs["previous_response_id"] = prev_id
                 response = await self.client.responses.parse(
                     model=self.model,
-                    instructions=self._get_system_prompt(),
+                    instructions=self._get_system_prompt(session_id),
                     input=[{"role": "user", "content": input_text}],
                     max_output_tokens=10000,
                     reasoning={"effort": getattr(self, "_reasoning_effort", "low")},
                     text_format=SingleCommand,
+                    service_tier="flex",
                     **_kwargs,
                 )
 
@@ -594,38 +599,86 @@ class CTFAgent:
 
         return actions
 
-    def _get_system_prompt(self) -> str:
-        """Get the system prompt for the AI agent."""
-        return """You are an expert CTF challenge solver. Analyze the target and find the flag.
+    def _get_rev_guidance(self) -> str:
+        lines = [
+            "REVERSING TIPS:",
+            "- Identify file type: file, ldd, checksec.",
+            "- Inspect strings and symbols: strings -a, nm -D, readelf -a, objdump -d.",
+            "- Use radare2 or Ghidra headless for static analysis; avoid interactive sessions.",
+            "- Look for input checks, strcmp/memcmp, key derivations, and flag formatting functions.",
+            "- Grep for the flag format in binaries/handouts; search embedded resources.",
+            "- If obfuscated, dump sections, analyze control flow, and reconstruct constants with python3.",
+        ]
+        return "\n".join(lines)
 
-TOOLS AVAILABLE:
-curl, wget, python3, cat, grep, strings, base64, openssl, hashcat, john, binwalk, steghide, and pwntools (via python3), and many others.
+    def _get_pwn_guidance(self) -> str:
+        lines = [
+            "BINARY EXPLOITATION TIPS:",
+            "- Profile binary: file, checksec, pwn checksec, seccomp-tools if present.",
+            "- Probe inputs for crashes or leaks; prefer scripted fuzzing via python3/pwntools.",
+            # "- Use non-interactive tooling: gdb is not interactive here; instead, use gdb -batch -ex commands or pwndbg scripts to dump info.",
+            # "- Look for format strings, buffer overflows, UAF, and GOT/PLT opportunities.",
+            # "- Leak addresses to defeat ASLR; compute libc base with pwntools if libc present.",
+            # "- Build ROP chains with ROPgadget or ropper; assemble payloads in python3.",
+            "- For remote sockets, always script with pwntools; avoid netcat interactivity. Avoid long bruteforcing on the remote socket.",
+            "- With pwntools, always set timeouts: remote(host, port, timeout=20); conn.timeout = 20; recv/recvuntil(..., timeout=20).",
+            "- Leverage Python analysis libs: angr for symbolic execution/path finding and constraint solving; Capstone for disassembly (optionally Keystone/Unicorn).",
+            "- Try to focus on using angr to find the flag.",
+        ]
+        return "\n".join(lines)
 
-IMPORTANT:
-• Use /workspace for temporary files (not /tmp)
-• Commands with pipes/redirects are automatically wrapped in bash
-• Use actual targets (URLs or socket host:port), not placeholders like TARGET_URL or TARGET_HOST/TARGET_PORT
+    def _get_system_prompt(self, session_id: Optional[str] = None) -> str:
+        """Get the system prompt for the AI agent, tailored by challenge type and context."""
+        # Base tools
+        tools_block = (
+            "TOOLS AVAILABLE:\n"
+            "curl, wget, python3, cat, grep, strings, base64, openssl, hashcat, john, binwalk, steghide, and pwntools (via python3), and many others.\n"
+        )
 
-GENERAL STRATEGY (one step at a time):
-At each turn, propose exactly ONE shell command with a short reasoning.
-If a URL is provided, prioritize interacting with the live site (e.g., curl -sSLi ...).
-If a socket host:port is provided, do NOT assume HTTP. Interact using python3 with pwntools. Only use curl or HTTP tools if an HTTP banner/response explicitly confirms HTTP.
-For multi-step interactive sockets, prefer pwntools scripts saved under /workspace (e.g., /workspace/solve.py) and run with python3.
-If handouts are provided, use them to inform live interactions or solve handout-only challenges.
-If any handout is an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted (avoid re-extracting if already extracted).
+        # Non-interactive reminder
+        non_interactive = (
+            "NON-INTERACTIVE ENVIRONMENT:\n"
+            "You do not have an interactive TTY. Avoid launching interactive tools (e.g., gdb TUI, interactive shells).\n"
+            "If you need debugger output, use non-interactive modes (e.g., gdb -batch -ex '...' --args ./bin) or scripted analysis.\n"
+        )
 
-PYTHON JAIL STRATEGY (when interacting with Python REPL/jail):
-• Try quick escapes: breakpoint() to drop into pdb (then use !/!shell to run commands), help(), dir(), vars(), locals(), globals().
-• Leverage builtins: import builtins; builtins.__import__('os').system('sh'), or __import__('os').popen('sh').read().
-• Explore object graph: object.__subclasses__() to locate Popen or IO classes to execute commands/read files.
-• Bypass filters: build names dynamically (chr(), bytes, join) to avoid blacklists; consider non‑Unicode payloads.
-• For sockets, prefer pwntools; to send bytes, write small python3 scripts rather than echo.
+        # General guidance
+        general = (
+            "IMPORTANT:\n"
+            "• Use /workspace for temporary files (not /tmp)\n"
+            "• Commands with pipes/redirects are automatically wrapped in bash\n"
+            "• Use actual targets (URLs or socket host:port), not placeholders like TARGET_URL or TARGET_HOST/TARGET_PORT\n\n"
+            "GENERAL STRATEGY (one step at a time):\n"
+            "At each turn, propose exactly ONE shell command with a short reasoning.\n"
+            "If a URL is provided, prioritize interacting with the live site (e.g., curl -sSLi ...).\n"
+            "If a socket host:port is provided, do NOT assume HTTP. Interact using python3 with pwntools. Only use curl or HTTP tools if an HTTP banner/response explicitly confirms HTTP.\n"
+            "For multi-step interactive sockets, prefer pwntools scripts saved under /workspace (e.g., /workspace/solve.py) and run with python3.\n"
+            "If handouts are provided, use them to inform live interactions or solve handout-only challenges.\n"
+            "If any handout is an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted (avoid re-extracting if already extracted).\n"
+        )
 
-IMPORTANT:
-Always extract archives first. Always look at the contents of the archive before trying to solve the challenge.
+        # Challenge-specific guidance
+        ct = self._session_challenge_type.get(session_id) if session_id else None
+        specific_blocks: List[str] = []
+        if ct == ChallengeType.REVERSE:
+            specific_blocks.append(self._get_rev_guidance())
+        if ct == ChallengeType.PWNABLE:
+            specific_blocks.append(self._get_pwn_guidance())
+        # Only include Python jail tips if context indicates pyjail; handled dynamically in analysis/iteration prompts
 
-RESPONSE FORMAT:
-Return exactly one shell command and a short reasoning."""
+        tail = (
+            "\nRESPONSE FORMAT:\n"
+            "Return exactly one shell command and a short reasoning."
+        )
+
+        return (
+            "You are an expert CTF challenge solver. Analyze the target and find the flag.\n\n"
+            + tools_block
+            + non_interactive
+            + general
+            + ("\n\n".join(specific_blocks) + ("\n" if specific_blocks else ""))
+            + tail
+        )
 
     def _build_analysis_prompt(
         self,
@@ -667,7 +720,7 @@ Return exactly one shell command and a short reasoning."""
             )
         if socket_host and socket_port:
             guidance_lines.append(
-                "This is a socket challenge: do NOT assume HTTP. Use python3 with pwntools. Only switch to HTTP tooling if an HTTP response is confirmed. Consider banner grabbing and protocol exploration."
+                "This is a socket challenge: do NOT assume HTTP. Use python3 with pwntools (set connection and read timeouts). Only switch to HTTP tooling if an HTTP response is confirmed. Consider banner grabbing and protocol exploration."
             )
         if not url and not (socket_host and socket_port):
             guidance_lines.append(
@@ -769,7 +822,7 @@ Start analyzing this challenge to find the flag. Propose exactly ONE shell comma
             )
         if socket_host and socket_port:
             guidance_lines.append(
-                "Socket target: do NOT assume HTTP. Use python3 with pwntools; Only use HTTP tools if HTTP is confirmed."
+                "Socket target: do NOT assume HTTP. Use python3 with pwntools and set timeouts (e.g., remote(host, port, timeout=20)); Only use HTTP tools if HTTP is confirmed."
             )
         if not url and not (socket_host and socket_port):
             guidance_lines.append(

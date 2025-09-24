@@ -302,6 +302,11 @@ function setupEventListeners() {
     document.getElementById('delete-btn').addEventListener('click', deleteSession);
     document.getElementById('handout-upload-btn').addEventListener('click', uploadHandouts);
     document.getElementById('target_type').addEventListener('change', onTargetTypeChange);
+    const hostEl = document.getElementById('host');
+    if (hostEl) {
+        hostEl.addEventListener('paste', onHostPaste);
+        hostEl.addEventListener('change', onHostChange);
+    }
     onTargetTypeChange();
 }
 
@@ -313,6 +318,53 @@ async function checkApiHealth() {
         }
     } catch (error) {
         showError('Backend API is not available. Please make sure the server is running.');
+    }
+}
+
+function parseHostPort(text) {
+    if (!text) return null;
+    let cleaned = String(text).trim();
+    if (!cleaned) return null;
+    cleaned = cleaned.replace(/\s+/g, ' ');
+    if (cleaned.includes('\n')) cleaned = cleaned.split('\n')[0];
+
+    // Try formats like: "nc host port" (with optional flags) or "host port"
+    let match = cleaned.match(/^(?:(?:nc|ncat|netcat)\s+(?:-[\w-]+\s+)*)?(\[[^\]]+\]|[A-Za-z0-9\.\-]+)\s+(\d{1,5})$/i);
+    if (!match) {
+        // Try "host:port" (supports IPv6 like [::1]:1337 or host:1337)
+        match = cleaned.match(/^(\[[^\]]+\]|[^:\s]+):(\d{1,5})$/);
+    }
+    if (!match) return null;
+
+    let host = match[1];
+    const port = match[2];
+    if (host.startsWith('[') && host.endsWith(']')) {
+        host = host.slice(1, -1);
+    }
+    const portNum = parseInt(port, 10);
+    if (Number.isNaN(portNum) || portNum < 1 || portNum > 65535) return null;
+    return { host, port: String(portNum) };
+}
+
+function onHostPaste(event) {
+    const text = (event.clipboardData || window.clipboardData).getData('text');
+    const parsed = parseHostPort(text);
+    if (parsed) {
+        event.preventDefault();
+        const hostInput = document.getElementById('host');
+        const portInput = document.getElementById('port');
+        if (hostInput) hostInput.value = parsed.host;
+        if (portInput) portInput.value = parsed.port;
+    }
+}
+
+function onHostChange(event) {
+    const parsed = parseHostPort(event.target.value);
+    if (parsed) {
+        const hostInput = document.getElementById('host');
+        const portInput = document.getElementById('port');
+        if (hostInput) hostInput.value = parsed.host;
+        if (portInput) portInput.value = parsed.port;
     }
 }
 

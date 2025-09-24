@@ -34,8 +34,12 @@ RUN apt-get update && apt-get install -y \
     # Build tools
     # gcc g++ make cmake \
     # Other useful tools
-    jq xmlstarlet
+    jq xmlstarlet \
+    gdb llvm
     # && rm -rf /var/lib/apt/lists/*
+
+# Set objdump to llvm-objdump (for multiarch support)
+RUN update-alternatives --install /usr/bin/objdump objdump /usr/bin/llvm-objdump 100
 
 # Install Python packages commonly used in CTFs
 RUN pip3 install --no-cache-dir --break-system-packages \
@@ -49,10 +53,9 @@ RUN pip3 install --no-cache-dir --break-system-packages \
     sqlparse \
     lxml \
     numpy scipy \
-    flask flask-unsign flask-unsign-wordlist itsdangerous
+    flask flask-unsign flask-unsign-wordlist itsdangerous \
+    angr capstone
     # jupyter \
-    # angr \
-    # capstone 
 
 # # Install additional tools via pip
 # RUN pip3 install --no-cache-dir \
@@ -85,6 +88,7 @@ RUN useradd -m -s /bin/bash ctfuser && \
 # Set up environment
 ENV PATH="/opt/ghidra:${PATH}"
 ENV GHIDRA_INSTALL_DIR="/opt/ghidra"
+ENV TERM=xterm
 
 # Switch to non-root user
 USER ctfuser

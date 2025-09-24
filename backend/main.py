@@ -80,6 +80,7 @@ try:
 except Exception as e:
     logger.error(f"Failed to initialize AI agent: {e}")
     ai_agent = None
+    exit(1)
 
 
 class WebSocketManager:

@@ -2,7 +2,7 @@ import docker
 from docker.errors import ImageNotFound
 import asyncio
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from docker.models.containers import Container
 import json
 import uuid
@@ -15,6 +15,8 @@ class DockerManager:
     def __init__(self):
         self.client = docker.from_env()
         self.containers: Dict[str, Container] = {}
+        # Cache of (uid, gid) for ctfuser per session/container
+        self._ctfuser_ids: Dict[str, Tuple[int, int]] = {}
 
     async def create_container(
         self, session_id: str, image: str = "ctf-agent:latest"
@@ -53,6 +55,22 @@ class DockerManager:
 
             # Wait a moment for container to fully start
             await asyncio.sleep(2)
+
+            # Ensure /workspace and handouts dir are owned by ctfuser even with a fresh volume
+            try:
+                container.exec_run(
+                    [
+                        "/bin/bash",
+                        "-c",
+                        "mkdir -p /workspace/handouts && chown -R ctfuser:ctfuser /workspace && chmod 775 /workspace /workspace/handouts",
+                    ],
+                    stdout=False,
+                    stderr=False,
+                    user="root",
+                )
+            except Exception:
+                # Best effort; not fatal
+                pass
 
             # Test basic functionality
             test_result = await self._test_container_functionality(session_id)
@@ -150,6 +168,57 @@ class DockerManager:
                 "container_status": "error",
             }
 
+    def _get_ctfuser_ids(self, session_id: str) -> Tuple[int, int]:
+        """Lookup and cache the uid,gid for user 'ctfuser' inside the container."""
+        if session_id in self._ctfuser_ids:
+            return self._ctfuser_ids[session_id]
+
+        if session_id not in self.containers:
+            raise ValueError(f"No container found for session {session_id}")
+
+        container = self.containers[session_id]
+        try:
+            uid_res = container.exec_run(
+                ["/bin/bash", "-c", "id -u ctfuser"],
+                stdout=True,
+                stderr=True,
+                user="root",
+                demux=True,
+            )
+            gid_res = container.exec_run(
+                ["/bin/bash", "-c", "id -g ctfuser"],
+                stdout=True,
+                stderr=True,
+                user="root",
+                demux=True,
+            )
+            uid_out = uid_res.output[0].decode("utf-8").strip() if uid_res.output else "1000"
+            gid_out = gid_res.output[0].decode("utf-8").strip() if gid_res.output else "1000"
+            uid = int(uid_out or 1000)
+            gid = int(gid_out or 1000)
+        except Exception:
+            # Fallback to common default UID/GID
+            uid, gid = 1000, 1000
+
+        self._ctfuser_ids[session_id] = (uid, gid)
+        return uid, gid
+
+    def _chown_path_ctfuser(self, session_id: str, path: str) -> None:
+        """Best-effort chown of a single path to ctfuser:ctfuser (run as root)."""
+        try:
+            if session_id not in self.containers:
+                return
+            container = self.containers[session_id]
+            container.exec_run(
+                ["/bin/bash", "-c", f"chown -h ctfuser:ctfuser '{path}'"],
+                stdout=False,
+                stderr=False,
+                user="root",
+            )
+        except Exception:
+            # Best effort only
+            pass
+
     async def copy_to_container(self, session_id: str, content: str, path: str) -> bool:
         """Copy content to a file in the container."""
         if session_id not in self.containers:
@@ -168,6 +237,12 @@ class DockerManager:
             file_data = content.encode("utf-8")
             tarinfo = tarfile.TarInfo(name=path.split("/")[-1])
             tarinfo.size = len(file_data)
+            # Ensure the file is owned by ctfuser inside the container
+            uid, gid = self._get_ctfuser_ids(session_id)
+            tarinfo.uid = uid
+            tarinfo.gid = gid
+            tarinfo.uname = "ctfuser"
+            tarinfo.gname = "ctfuser"
 
             tar.addfile(tarinfo, io.BytesIO(file_data))
             tar.close()
@@ -177,6 +252,8 @@ class DockerManager:
             container.put_archive(
                 path=path.rsplit("/", 1)[0] or "/", data=tar_stream.read()
             )
+            # Fallback chown in case tar ownership was not honored
+            self._chown_path_ctfuser(session_id, path)
             return True
 
         except Exception as e:
@@ -200,9 +277,14 @@ class DockerManager:
             dest_dir = container_dest_path.rsplit("/", 1)[0] or "/"
             try:
                 container.exec_run(
-                    ["/bin/bash", "-c", f"mkdir -p '{dest_dir}'"],
+                    [
+                        "/bin/bash",
+                        "-c",
+                        f"mkdir -p '{dest_dir}' && chown ctfuser:ctfuser '{dest_dir}'",
+                    ],
                     stdout=False,
                     stderr=False,
+                    user="root",
                 )
             except Exception:
                 pass
@@ -215,11 +297,19 @@ class DockerManager:
                 arcname = container_dest_path.split("/")[-1]
                 tarinfo = tarfile.TarInfo(name=arcname)
                 tarinfo.size = len(data)
+                # Ensure the file is owned by ctfuser inside the container
+                uid, gid = self._get_ctfuser_ids(session_id)
+                tarinfo.uid = uid
+                tarinfo.gid = gid
+                tarinfo.uname = "ctfuser"
+                tarinfo.gname = "ctfuser"
                 tar.addfile(tarinfo, io.BytesIO(data))
             tar_stream.seek(0)
 
             # Put archive into destination directory
             container.put_archive(path=dest_dir, data=tar_stream.read())
+            # Fallback chown in case tar ownership was not honored
+            self._chown_path_ctfuser(session_id, container_dest_path)
             return True
         except Exception as e:
             logger.error(
