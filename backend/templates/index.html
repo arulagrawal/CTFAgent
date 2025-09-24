@@ -244,6 +244,13 @@
                 </svg>
                 <h3 class="text-lg font-medium">Action Log</h3>
                 <span id="live-indicator" class="hidden ml-2 px-2 py-1 bg-green-100 text-green-800 text-xs rounded-full">Live</span>
+                <span id="ai-thinking" class="hidden ml-2 px-2 py-1 bg-yellow-100 text-yellow-800 text-xs rounded-full flex items-center">
+                    <svg class="animate-spin -ml-1 mr-1 h-4 w-4 text-yellow-700" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+                    </svg>
+                    Thinking…
+                </span>
             </div>
             
             <div id="action-log" class="action-log space-y-4" style="max-height: 65vh; overflow-y: auto;">
@@ -506,6 +513,15 @@ function handleWebSocketMessage(message) {
         case 'action':
             addActionToLog(message.data);
             break;
+        case 'action_create':
+            addActionToLog(message.data);
+            break;
+        case 'action_chunk':
+            appendChunkToAction(message.data);
+            break;
+        case 'action_complete':
+            finalizeAction(message.data);
+            break;
         case 'flag_found':
             addActionToLog(message.data);
             if (currentSession) {
@@ -519,6 +535,9 @@ function handleWebSocketMessage(message) {
             if (currentSession) {
                 updateSessionStatus({ ...currentSession, ...message.data });
             }
+            break;
+        case 'ai_status':
+            setAiThinking(!!(message.data && message.data.thinking));
             break;
     }
 }
@@ -680,6 +699,9 @@ function addActionToLog(action) {
     
     const actionDiv = document.createElement('div');
     actionDiv.className = 'border-l-4 border-gray-200 pl-4 pb-4';
+    if (action.id) {
+        actionDiv.dataset.actionId = action.id;
+    }
     
     const timestamp = new Date(action.timestamp).toLocaleTimeString();
     const icon = getActionIcon(action);
@@ -714,7 +736,7 @@ function addActionToLog(action) {
             </div>
         ` : ''}
         
-        ${action.output ? `
+        ${action.output !== undefined ? `
             <div>
                 <div class=\"text-xs text-gray-500 mb-1\">Output:</div>
                 <pre class=\"js-output terminal text-xs max-h-32 overflow-y-auto whitespace-pre-wrap p-2 rounded\"></pre>
@@ -738,11 +760,63 @@ function addActionToLog(action) {
         const c = actionDiv.querySelector('.js-command');
         if (c) c.textContent = String(action.command);
     }
-    if (action.output) {
+    if (action.output !== undefined) {
         const o = actionDiv.querySelector('.js-output');
-        if (o) o.textContent = String(action.output);
+        if (o) o.textContent = String(action.output || '');
     }
     logContainer.scrollTop = logContainer.scrollHeight;
+}
+
+function appendChunkToAction(data) {
+    try {
+        const { id, channel, chunk } = data || {};
+        if (!id) return;
+        const logContainer = document.getElementById('action-log');
+        const el = logContainer.querySelector(`[data-action-id="${id}"] .js-output`);
+        if (el) {
+            el.textContent += String(chunk || '');
+            el.scrollTop = el.scrollHeight;
+        }
+    } catch (e) {
+        console.error('appendChunkToAction error', e);
+    }
+}
+
+function finalizeAction(data) {
+    try {
+        const { id, final_output, success } = data || {};
+        if (!id) return;
+        const logContainer = document.getElementById('action-log');
+        const wrapper = logContainer.querySelector(`[data-action-id="${id}"]`);
+        if (!wrapper) return;
+        const outEl = wrapper.querySelector('.js-output');
+        if (outEl && typeof final_output === 'string') {
+            outEl.textContent = final_output;
+        }
+        if (typeof success === 'boolean' && success === false) {
+            // Add failure tag if not already present
+            const exists = wrapper.querySelector('.js-failtag');
+            if (!exists) {
+                const fail = document.createElement('div');
+                fail.className = 'js-failtag mt-2 p-2 bg-red-50 border border-red-200 rounded text-sm text-red-700';
+                fail.textContent = '⚠️ This action failed';
+                wrapper.appendChild(fail);
+            }
+        }
+        logContainer.scrollTop = logContainer.scrollHeight;
+    } catch (e) {
+        console.error('finalizeAction error', e);
+    }
+}
+
+function setAiThinking(thinking) {
+    const badge = document.getElementById('ai-thinking');
+    if (!badge) return;
+    if (thinking) {
+        badge.classList.remove('hidden');
+    } else {
+        badge.classList.add('hidden');
+    }
 }
 
 function getActionIcon(action) {

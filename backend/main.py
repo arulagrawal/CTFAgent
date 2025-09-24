@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import sys
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, List
@@ -80,7 +81,7 @@ try:
 except Exception as e:
     logger.error(f"Failed to initialize AI agent: {e}")
     ai_agent = None
-    exit(1)
+    sys.exit(1)
 
 
 class WebSocketManager:
@@ -377,14 +378,32 @@ async def solve_challenge_background_form(
 
     # WebSocket callback for real-time updates
     async def websocket_callback(event_type: str, data: dict):
-        # Update session actions in real-time
-        if event_type == "action" and "timestamp" in data:
-            action = AgentAction(**data)
-            session.actions.append(action)
-            session.updated_at = datetime.now(timezone.utc)
-            logger.info(
-                f"Added action to session {session_id}: {data.get('action_type', 'unknown')}"
-            )
+        # Maintain session actions and forward messages
+        try:
+            if event_type in ("action", "action_create") and "timestamp" in data:
+                action = AgentAction(**data)
+                # Ensure id presence
+                if not getattr(action, "id", None):
+                    import uuid as _uuid
+                    action.id = _uuid.uuid4().hex
+                session.actions.append(action)
+                session.updated_at = datetime.now(timezone.utc)
+                logger.info(
+                    f"Added action to session {session_id}: {data.get('action_type', 'unknown')}"
+                )
+            elif event_type == "action_complete" and data.get("id"):
+                # Update the existing action's output/success
+                for a in session.actions:
+                    if getattr(a, "id", None) == data["id"]:
+                        final_output = data.get("final_output")
+                        if final_output is not None:
+                            a.output = final_output
+                        if "success" in data:
+                            a.success = bool(data["success"])  # type: ignore[assignment]
+                        session.updated_at = datetime.now(timezone.utc)
+                        break
+        except Exception as e:
+            logger.debug(f"websocket_callback state update error: {e}")
 
         message = WebSocketMessage(type=event_type, session_id=session_id, data=data)
         logger.info(f"Sending WebSocket message: {event_type} for session {session_id}")

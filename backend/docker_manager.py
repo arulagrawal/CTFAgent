@@ -168,6 +168,107 @@ class DockerManager:
                 "container_status": "error",
             }
 
+    async def execute_command_stream(
+        self,
+        session_id: str,
+        command: str,
+        on_chunk,
+        timeout: int = 300,
+    ) -> Dict[str, Any]:
+        """Execute a command and stream output via an async callback.
+
+        on_chunk(channel: str, text: str) -> Awaitable[None]
+        channel is one of "stdout" | "stderr".
+        """
+        if session_id not in self.containers:
+            raise ValueError(f"No container found for session {session_id}")
+
+        container = self.containers[session_id]
+
+        try:
+            # Check container status before execution
+            container.reload()
+            if container.status != "running":
+                await on_chunk("stderr", f"Container is not running (status: {container.status})\n")
+                return {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"Container is not running (status: {container.status})",
+                    "success": False,
+                    "container_status": container.status,
+                }
+
+            logger.info(f"Executing (stream) in {session_id}: {command}")
+
+            # Execute command - use shell for complex commands with pipes, &&, etc.
+            needs_shell = any(op in command for op in ["&&", "||", "|", ">", "<", ";", "$(", "`"])
+            if needs_shell:
+                exec_command = ["/bin/bash", "-lc", command]
+            else:
+                exec_command = command
+
+            stdout_acc: list[str] = []
+            stderr_acc: list[str] = []
+
+            import asyncio as _asyncio
+
+            loop = _asyncio.get_running_loop()
+
+            def _run_and_stream() -> int:
+                try:
+                    # Use low-level API for streaming
+                    exec_id = self.client.api.exec_create(
+                        container.id,
+                        exec_command,
+                        stdout=True,
+                        stderr=True,
+                        stdin=False,
+                        tty=False,
+                    )["Id"]
+
+                    # Start streaming
+                    stream = self.client.api.exec_start(exec_id, stream=True, demux=True)
+                    for out, err in stream:
+                        if out:
+                            text = out.decode("utf-8", errors="replace")
+                            stdout_acc.append(text)
+                            _asyncio.run_coroutine_threadsafe(on_chunk("stdout", text), loop)
+                        if err:
+                            text = err.decode("utf-8", errors="replace")
+                            stderr_acc.append(text)
+                            _asyncio.run_coroutine_threadsafe(on_chunk("stderr", text), loop)
+
+                    info = self.client.api.exec_inspect(exec_id)
+                    code = info.get("ExitCode", -1)
+                    return int(code if code is not None else -1)
+                except Exception as e:
+                    _asyncio.run_coroutine_threadsafe(on_chunk("stderr", f"Execution error: {e}\n"), loop)
+                    return -1
+
+            exit_code: int = await _asyncio.to_thread(_run_and_stream)
+
+            return {
+                "exit_code": exit_code,
+                "stdout": "".join(stdout_acc),
+                "stderr": "".join(stderr_acc),
+                "success": exit_code == 0,
+                "container_status": container.status,
+            }
+
+        except Exception as e:
+            logger.error(f"Streaming execution failed in session {session_id}: {e}")
+            try:
+                await on_chunk("stderr", f"Execution error: {str(e)}\n")
+            except Exception:
+                pass
+            return {
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"Execution error: {str(e)}",
+                "success": False,
+                "container_status": "error",
+            }
+
     def _get_ctfuser_ids(self, session_id: str) -> Tuple[int, int]:
         """Lookup and cache the uid,gid for user 'ctfuser' inside the container."""
         if session_id in self._ctfuser_ids:

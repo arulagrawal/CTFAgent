@@ -31,6 +31,7 @@ class ChallengeRequest(BaseModel):
 
 
 class AgentAction(BaseModel):
+    id: Optional[str] = None
     timestamp: datetime
     action_type: str
     command: Optional[str] = None
