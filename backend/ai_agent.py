@@ -506,16 +506,8 @@ class CTFAgent:
                 return actions
 
             # Use structured output directly (SingleCommand)
-            try:
-                sc = getattr(response, "output_parsed", None)
-            except Exception:
-                sc = None
-
-            if (
-                sc is None
-                or not getattr(sc, "command", None)
-                or not str(getattr(sc, "command", "")).strip()
-            ):
+            output = response.output_parsed
+            if not output:
                 logger.warning("AI returned empty structured command from Responses API")
                 error_action = AgentAction(
                     timestamp=datetime.now(timezone.utc),
@@ -532,74 +524,57 @@ class CTFAgent:
                 if callback:
                     await callback("action", error_action.dict())
                 return actions
+            else:
+                command = output.command
+                reasoning = output.reasoning
 
-            command = str(getattr(sc, "command", "")).strip()
-            reasoning = (
-                str(getattr(sc, "reasoning", "")).strip() or "No reasoning provided"
+            # Execute command in container
+            result = await self.docker_manager.execute_command(session_id, command)
+
+            # Enhanced output formatting with better observability
+            output_parts = []
+            output_parts.append(f"COMMAND: {command}")
+            output_parts.append(f"EXIT CODE: {result.get('exit_code', 'unknown')}")
+
+            if result.get("stdout"):
+                output_parts.append(f"STDOUT:\n{result['stdout']}")
+            else:
+                output_parts.append("STDOUT: (empty)")
+
+            if result.get("stderr"):
+                output_parts.append(f"STDERR:\n{result['stderr']}")
+            else:
+                output_parts.append("STDERR: (empty)")
+
+            # Add diagnostic info for failed commands
+            if not result["success"]:
+                output_parts.append(
+                    f"FAILURE REASON: Command exited with code {result.get('exit_code', 'unknown')}"
+                )
+
+                # Add container health check
+                container_status = await self._check_container_health(session_id)
+                if container_status:
+                    output_parts.append(f"CONTAINER STATUS: {container_status}")
+
+            formatted_output = "\n\n".join(output_parts)
+
+            action = AgentAction(
+                timestamp=datetime.now(timezone.utc),
+                action_type="command_execution",
+                command=command,
+                output=formatted_output,
+                reasoning=reasoning,
+                success=result["success"],
             )
 
-            # Validate command doesn't contain clear JSON key artifacts
-            if any(
-                artifact in command for artifact in ['"command":', '"reasoning":']
-            ):
-                logger.warning(
-                    f"Skipping malformed command that still includes JSON keys: {command}"
-                )
-                return actions
+            actions.append(action)
 
-            # Clean up any remaining quotes or artifacts (but preserve quotes inside the command)
-            command = command.strip('"{}[]')
+            if callback:
+                await callback("action", action.dict())
 
-            if not command or len(command.strip()) == 0:
-                return actions
-
-                # Execute command in container
-                result = await self.docker_manager.execute_command(session_id, command)
-
-                # Enhanced output formatting with better observability
-                output_parts = []
-                output_parts.append(f"COMMAND: {command}")
-                output_parts.append(f"EXIT CODE: {result.get('exit_code', 'unknown')}")
-
-                if result.get("stdout"):
-                    output_parts.append(f"STDOUT:\n{result['stdout']}")
-                else:
-                    output_parts.append("STDOUT: (empty)")
-
-                if result.get("stderr"):
-                    output_parts.append(f"STDERR:\n{result['stderr']}")
-                else:
-                    output_parts.append("STDERR: (empty)")
-
-                # Add diagnostic info for failed commands
-                if not result["success"]:
-                    output_parts.append(
-                        f"FAILURE REASON: Command exited with code {result.get('exit_code', 'unknown')}"
-                    )
-
-                    # Add container health check
-                    container_status = await self._check_container_health(session_id)
-                    if container_status:
-                        output_parts.append(f"CONTAINER STATUS: {container_status}")
-
-                formatted_output = "\n\n".join(output_parts)
-
-                action = AgentAction(
-                    timestamp=datetime.now(timezone.utc),
-                    action_type="command_execution",
-                    command=command,
-                    output=formatted_output,
-                    reasoning=reasoning,
-                    success=result["success"],
-                )
-
-                actions.append(action)
-
-                if callback:
-                    await callback("action", action.dict())
-
-                # Small delay to prevent overwhelming
-                await asyncio.sleep(0.5)
+            # Small delay to prevent overwhelming
+            await asyncio.sleep(0.5)
 
         except asyncio.CancelledError:
             # Propagate cancellation to stop immediately
