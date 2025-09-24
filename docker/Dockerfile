@@ -48,7 +48,8 @@ RUN pip3 install --no-cache-dir --break-system-packages \
     paramiko \
     sqlparse \
     lxml \
-    numpy scipy
+    numpy scipy \
+    flask flask-unsign flask-unsign-wordlist itsdangerous
     # jupyter \
     # angr \
     # capstone 

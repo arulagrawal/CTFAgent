@@ -32,6 +32,8 @@ class CTFAgent:
         self._session_handouts: Dict[str, List[str]] = {}
         # Track OpenAI usage per session
         self._session_usage: Dict[str, Dict[str, Any]] = {}
+        # Track last Responses API response.id per session for conversation state
+        self._session_last_response_id: Dict[str, Optional[str]] = {}
 
     def _init_usage(self, session_id: str) -> None:
         self._session_usage[session_id] = {
@@ -275,16 +277,6 @@ class CTFAgent:
                         f"Exit Code: {container.attrs['State']['ExitCode']}"
                     )
 
-            # Check network connectivity
-            try:
-                test_result = container.exec_run("ping -c 1 8.8.8.8")
-                if test_result.exit_code != 0:
-                    status_info.append("Network: No internet connectivity")
-                else:
-                    status_info.append("Network: Internet accessible")
-            except Exception:
-                status_info.append("Network: Unable to test connectivity")
-
             return " | ".join(status_info)
 
         except Exception as e:
@@ -301,6 +293,7 @@ class CTFAgent:
         description: Optional[str] = None,
         uploaded_files: Optional[List[str]] = None,
         callback: Optional[Callable] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> List[AgentAction]:
         """Main method to solve a CTF challenge."""
         actions = []
@@ -308,6 +301,15 @@ class CTFAgent:
         try:
             # Initialize usage tracking
             self._init_usage(session_id)
+            # Set per-session reasoning effort (default low)
+            try:
+                self._reasoning_effort = (
+                    str(reasoning_effort).lower() if reasoning_effort in ("low", "medium") else "low"
+                )
+            except Exception:
+                self._reasoning_effort = "low"
+            # Reset conversation state
+            self._session_last_response_id[session_id] = None
             # Create container
             await self.docker_manager.create_container(session_id)
             # Ensure handouts dir exists
@@ -378,7 +380,7 @@ class CTFAgent:
             actions.extend(analysis_actions)
 
             # Iterative solving process (strict one-by-one)
-            max_iterations = 20
+            max_iterations = 50
             for i in range(max_iterations):
                 # Check if flag found
                 flag = self._check_for_flag(actions, flag_format)
@@ -464,48 +466,31 @@ class CTFAgent:
         actions = []
 
         try:
-            # Build consolidated input for Responses API (single-step)
-            context_blocks = []
-            if len(previous_actions) > 0:
-                recent_context = "Previous session context:\n"
-                for action in previous_actions:
-                    if action.command:
-                        recent_context += f"Executed: {action.command}\n"
-                        if action.output and len(action.output.strip()) > 0:
-                            # Extract and include FULL STDOUT (not truncated)
-                            stdout_match = re.search(
-                                r"STDOUT:\n(.*?)(?:\n\nSTDERR:|$)",
-                                action.output,
-                                re.DOTALL,
-                            )
-                            if stdout_match:
-                                stdout_content = stdout_match.group(1)
-                                recent_context += f"STDOUT (full):\n{stdout_content}\n"
-                            else:
-                                # Fallback: include full recorded output
-                                recent_context += f"Output (full):\n{action.output}\n"
-                context_blocks.append(recent_context)
+            # Use the provided prompt directly; it already contains any needed history
+            input_text = str(prompt)
 
-            user_block = f"User request:\n{prompt}"
-            input_text = (
-                "\n\n".join(context_blocks + [user_block])
-                if context_blocks
-                else user_block
-            )
-
-            # Call Responses API with structured output (SingleCommand)
+            # Call Responses API with structured output (SingleCommand) and conversation state
             try:
+                prev_id = self._session_last_response_id.get(session_id)
+                _kwargs = {}
+                if prev_id:
+                    _kwargs["previous_response_id"] = prev_id
                 response = await self.client.responses.parse(
                     model=self.model,
                     instructions=self._get_system_prompt(),
                     input=[{"role": "user", "content": input_text}],
                     max_output_tokens=10000,
-                    reasoning={"effort": "medium"},
+                    reasoning={"effort": getattr(self, "_reasoning_effort", "low")},
                     text_format=SingleCommand,
+                    **_kwargs,
                 )
                 # Track usage for Responses API
                 self._update_usage_from_response(session_id, response)
-                use_responses_api = True
+                # Update last response id for conversation continuation
+                try:
+                    self._session_last_response_id[session_id] = getattr(response, "id", None)
+                except Exception:
+                    pass
             except Exception as e:
                 logger.error(f"Responses API call failed: {e}")
                 error_action = AgentAction(
@@ -577,7 +562,7 @@ class CTFAgent:
                         }
                     ]
             except Exception:
-                commands = self._parse_ai_response(ai_response)
+                pass
 
             # If no commands were parsed, log the full AI response for debugging
             if not commands:
@@ -596,65 +581,6 @@ class CTFAgent:
                 actions.append(error_action)
                 if callback:
                     await callback("action", error_action.dict())
-
-                # Try a follow-up request with more explicit instructions
-                followup_prompt = f"""The previous response didn't contain an extractable command. Provide a SINGLE shell command as a JSON object (no prose), matching this schema:
-
-{{
-  "command": "curl -sSL {prompt.split('Target: ')[1].split()[0] if 'Target: ' in prompt else 'TARGET_URL'}",
-  "reasoning": "Initial reconnaissance"
-}}
-"""
-
-                try:
-                    followup_response = await self.client.responses.parse(
-                        model=self.model,
-                        instructions="You are a CTF expert. Provide a SINGLE shell command in JSON object format only.",
-                        input=[{"role": "user", "content": followup_prompt}],
-                        max_output_tokens=10000,
-                        reasoning={"effort": "medium"},
-                        text_format=SingleCommand,
-                    )
-                    self._update_usage_from_response(session_id, followup_response)
-                    followup_text = getattr(followup_response, "output_text", "") or ""
-                    try:
-                        # Prefer structured parse from Responses.parse
-                        sc_fu = getattr(followup_response, "output_parsed", None)
-                        if sc_fu is not None and getattr(sc_fu, "command", None):
-                            commands = [
-                                {
-                                    "command": str(sc_fu.command or "").strip(),
-                                    "reasoning": str(
-                                        getattr(sc_fu, "reasoning", "")
-                                        or "No reasoning provided"
-                                    ).strip(),
-                                }
-                            ]
-                        else:
-                            parsed_fu = json.loads(followup_text)
-                            if isinstance(parsed_fu, dict) and parsed_fu.get("command"):
-                                commands = [
-                                    {
-                                        "command": str(
-                                            parsed_fu.get("command", "")
-                                        ).strip(),
-                                        "reasoning": str(
-                                            parsed_fu.get("reasoning", "")
-                                        ).strip()
-                                        or "No reasoning provided",
-                                    }
-                                ]
-                    except Exception:
-                        commands = self._parse_ai_response(followup_text)[:1]
-                    if commands:
-                        logger.info("Extracted a single command from followup request")
-                    else:
-                        logger.error("Followup request also failed to produce commands")
-                        return actions
-
-                except Exception as followup_error:
-                    logger.error(f"Followup request failed: {followup_error}")
-                    return actions
 
             # Execute only one command per step
             for command_data in commands[:1]:
@@ -675,37 +601,6 @@ class CTFAgent:
 
                 # Clean up any remaining quotes or artifacts (but preserve quotes inside the command)
                 command = command.strip('"{}[]')
-
-                # Replace placeholder targets with actual values when present in prompt
-                # URL replacement
-                if "TARGET_URL" in command or "TARGET_IP" in command:
-                    actual_url_match = re.search(r"Target URL:\s*(\S+)", prompt)
-                    if actual_url_match:
-                        actual_url = actual_url_match.group(1)
-                        command = command.replace("TARGET_URL", actual_url)
-                        command = command.replace("TARGET_IP", actual_url)
-                        logger.info(f"Replaced placeholder with actual URL: {command}")
-
-                # Socket replacement
-                if "TARGET_HOST" in command or "TARGET_PORT" in command:
-                    host_match = re.search(r"Target SOCKET:\s*([^:\s]+):(\d+)", prompt)
-                    if host_match:
-                        actual_host = host_match.group(1)
-                        actual_port = host_match.group(2)
-                        command = command.replace("TARGET_HOST", actual_host)
-                        command = command.replace("TARGET_PORT", actual_port)
-                        logger.info(
-                            f"Replaced placeholders with actual socket: {command}"
-                        )
-
-                # If command is reading a full file, encourage using cat (less confusion on output)
-                if re.search(r"sed\s+-n\s+'1,\d+p'\s+\S+", command):
-                    # Replace with cat for clarity
-                    file_match = re.search(r"sed\s+-n\s+'1,\d+p'\s+(\S+)", command)
-                    if file_match:
-                        file_path = file_match.group(1)
-                        command = f"cat {file_path}"
-                        logger.info(f"Rewrote sed full-file read to cat: {command}")
 
                 if not command or len(command.strip()) == 0:
                     continue
@@ -807,14 +702,7 @@ IMPORTANT:
 Always extract archives first. Always look at the contents of the archive before trying to solve the challenge.
 
 RESPONSE FORMAT:
-Respond with ONLY a single JSON object with fields {command, reasoning}:
-
-{
-  "command": "curl -sSL https://actual-url.com",
-  "reasoning": "Initial reconnaissance"
-}
-
-No other text. Just the JSON object."""
+Return exactly one shell command and a short reasoning."""
 
     def _build_analysis_prompt(
         self,
@@ -873,7 +761,7 @@ Flag format: {flag_format}
 {desc_block}
 {files_block}{guidance}
 
-Start analyzing this challenge to find the flag. Propose exactly ONE command as a JSON object (keys: command, reasoning)."""
+Start analyzing this challenge to find the flag. Propose exactly ONE shell command with a short reasoning."""
 
     def _build_iteration_prompt(
         self,
@@ -888,30 +776,52 @@ Start analyzing this challenge to find the flag. Propose exactly ONE command as 
         """Build prompt for iterative solving tailored to URL/socket/handout-only."""
         import re  # For regex operations
 
-        # Give ALL history - no limits so GPT has complete context
-        recent_actions = actions
-
-        context = "Previous work:\n"
-        for action in recent_actions:
-            if action.command:
-                context += f"• {action.command}\n"
-                if action.output:
-                    # Extract STDOUT content
-                    stdout_match = re.search(
-                        r"STDOUT:\n(.*?)(?:\n\nSTDERR:|$)", action.output, re.DOTALL
-                    )
-                    if stdout_match:
-                        stdout_content = stdout_match.group(1).strip()
-                        if stdout_content and len(stdout_content) > 0:
-                            # Keep more output for better context
-                            if len(stdout_content) > 500:
-                                output_preview = stdout_content[:500] + "..."
+        # Summarize only the most recent command result to keep tokens low
+        recent_block = ""
+        try:
+            last = next((a for a in reversed(actions) if a.command), None)
+        except Exception:
+            last = None
+        if last:
+            recent_block = "Previous result:\n"
+            recent_block += f"• {last.command}\n"
+            if last.output:
+                # Extract STDOUT
+                stdout_match = re.search(
+                    r"STDOUT:\n(.*?)(?:\n\nSTDERR:|$)", last.output, re.DOTALL
+                )
+                if stdout_match:
+                    stdout_content = stdout_match.group(1).strip()
+                    if stdout_content:
+                        stdout_preview = stdout_content
+                        recent_block += f"  → {stdout_preview}\n"
+                # Exit code
+                try:
+                    exit_match = re.search(r"EXIT CODE:\s*(\d+)", last.output)
+                    if exit_match and exit_match.group(1) != "0":
+                        recent_block += f"  → exit={exit_match.group(1)}\n"
+                except Exception:
+                    pass
+                # STDERR
+                try:
+                    stderr_match = re.search(r"STDERR:\n(.*)", last.output, re.DOTALL)
+                    if stderr_match:
+                        stderr_content = stderr_match.group(1).strip()
+                        if stderr_content:
+                            PREVIEW_LIMIT = 600
+                            if len(stderr_content) > PREVIEW_LIMIT:
+                                head = stderr_content[: PREVIEW_LIMIT // 2]
+                                tail = stderr_content[-(PREVIEW_LIMIT // 2) :]
+                                stderr_preview = f"{head}\n...\n{tail}"
                             else:
-                                output_preview = stdout_content
-                            context += f"  → {output_preview}\n"
-                    elif not action.success:
-                        context += f"  → Failed\n"
-                context += "\n"
+                                stderr_preview = stderr_content
+                            recent_block += f"  → STDERR: {stderr_preview}\n"
+                except Exception:
+                    pass
+            else:
+                if not last.success:
+                    recent_block += "  → Failed\n"
+            recent_block += "\n"
 
         files_block = ""
         if uploaded_files:
@@ -947,363 +857,12 @@ Start analyzing this challenge to find the flag. Propose exactly ONE command as 
             guidance_lines.append(self._get_pyjail_guidance())
         guidance = " ".join(guidance_lines)
 
-        return f"""{context}
+        return f"""{recent_block}
 {chr(10).join(target_block)}
 Flag format: {flag_format}
 
 {files_block}
-Continue working toward finding the flag. {guidance} Propose exactly ONE next shell command with a short reasoning. If you just read a local file, avoid reprinting it fully; summarize and move on. Return only a single JSON object with keys command and reasoning."""
-
-    def _parse_ai_response(self, response: str) -> List[Dict[str, str]]:
-        """Parse AI response to extract commands with improved error handling."""
-        logger.debug(f"Parsing AI response: {repr(response[:500])}...")
-        try:
-            # First, try to find JSON blocks with various formats
-            json_patterns = [
-                r"```json\s*(.*?)\s*```",  # Standard JSON blocks
-                r"```\s*(\[.*?\])\s*```",  # JSON arrays in code blocks
-                r"(\[[\s\S]*?\])",  # Any JSON array in the response
-                r"```\s*([\s\S]*?)\s*```",  # Any code block content
-            ]
-
-            # Also try to extract individual command/reasoning pairs from malformed JSON
-            # Handle escaped quotes in commands by using a more sophisticated pattern
-            command_reasoning_pattern = r'"command":\s*"((?:[^"\\]|\\.)*)"\s*[,}]?[\s\S]*?"reasoning":\s*"((?:[^"\\]|\\.)*)"'
-            command_reasoning_matches = re.findall(
-                command_reasoning_pattern, response, re.DOTALL
-            )
-            if command_reasoning_matches:
-                extracted_commands = []
-                for cmd, reason in command_reasoning_matches:
-                    # Unescape any escaped quotes
-                    cmd = cmd.replace('\\"', '"').replace("\\'", "'")
-                    reason = reason.replace('\\"', '"').replace("\\'", "'")
-                    extracted_commands.append(
-                        {
-                            "command": cmd.strip(),
-                            "reasoning": (
-                                reason.strip() if reason else "No reasoning provided"
-                            ),
-                        }
-                    )
-                if extracted_commands:
-                    logger.debug(
-                        f"Extracted {len(extracted_commands)} commands via regex pattern"
-                    )
-                    for i, cmd in enumerate(extracted_commands):
-                        logger.debug(f"Command {i+1}: {repr(cmd['command'])}")
-                    return extracted_commands[:3]
-
-            for pattern in json_patterns:
-                matches = re.findall(pattern, response, re.DOTALL)
-                for match in matches:
-                    try:
-                        logger.debug(
-                            f"Attempting to parse JSON: {repr(match[:200])}..."
-                        )
-                        parsed = json.loads(match)
-                        if isinstance(parsed, list) and all(
-                            isinstance(item, dict) for item in parsed
-                        ):
-                            # Validate that each command has required fields
-                            valid_commands = []
-                            for cmd in parsed:
-                                if "command" in cmd:
-                                    command_text = cmd["command"].strip()
-                                    logger.debug(
-                                        f"Extracted command from JSON: {repr(command_text)}"
-                                    )
-                                    valid_commands.append(
-                                        {
-                                            "command": command_text,
-                                            "reasoning": cmd.get(
-                                                "reasoning", "No reasoning provided"
-                                            ).strip(),
-                                        }
-                                    )
-                            if valid_commands:
-                                logger.debug(
-                                    f"Successfully parsed {len(valid_commands)} commands from JSON"
-                                )
-                                return valid_commands
-                    except json.JSONDecodeError as e:
-                        logger.debug(f"JSON parse failed: {e}")
-                        # Try to fix common JSON issues and retry
-                        fixed_match = self._fix_partial_json(match)
-                        if fixed_match != match:
-                            try:
-                                logger.debug(
-                                    f"Trying fixed JSON: {repr(fixed_match[:200])}..."
-                                )
-                                parsed = json.loads(fixed_match)
-                                if isinstance(parsed, list) and all(
-                                    isinstance(item, dict) for item in parsed
-                                ):
-                                    valid_commands = []
-                                    for cmd in parsed:
-                                        if "command" in cmd:
-                                            command_text = cmd["command"].strip()
-                                            logger.debug(
-                                                f"Extracted command from fixed JSON: {repr(command_text)}"
-                                            )
-                                            valid_commands.append(
-                                                {
-                                                    "command": command_text,
-                                                    "reasoning": cmd.get(
-                                                        "reasoning",
-                                                        "No reasoning provided",
-                                                    ).strip(),
-                                                }
-                                            )
-                                    if valid_commands:
-                                        logger.debug(
-                                            f"Successfully parsed {len(valid_commands)} commands from fixed JSON"
-                                        )
-                                        return valid_commands
-                            except json.JSONDecodeError:
-                                continue
-                        continue
-
-            # Fallback: Look for structured text patterns
-            commands = []
-            lines = response.split("\n")
-
-            # Pattern 1: Command: ... Reasoning: ...
-            for i, line in enumerate(lines):
-                line = line.strip()
-                if line.lower().startswith(("command:", "- command:", "• command:")):
-                    command = line.split(":", 1)[1].strip()
-                    reasoning = "No reasoning provided"
-
-                    # Look for reasoning in next few lines
-                    for j in range(i + 1, min(i + 4, len(lines))):
-                        next_line = lines[j].strip()
-                        if next_line.lower().startswith(
-                            ("reasoning:", "- reasoning:", "• reasoning:")
-                        ):
-                            reasoning = next_line.split(":", 1)[1].strip()
-                            break
-
-                    if command:
-                        commands.append({"command": command, "reasoning": reasoning})
-
-            # Pattern 2: Look for shell commands (starting with common commands)
-            if not commands:
-                common_commands = [
-                    "curl",
-                    "wget",
-                    "python",
-                    "python3",
-                    "ls",
-                    "cat",
-                    "grep",
-                    "find",
-                    "nmap",
-                    "gobuster",
-                    "dirb",
-                    "nc",
-                    "netcat",
-                    "dig",
-                    "host",
-                    "ping",
-                    "traceroute",
-                    "telnet",
-                    "ssh",
-                    "ftp",
-                    "scp",
-                    "rsync",
-                ]
-                for line in lines:
-                    line = line.strip()
-                    # Remove common prefixes
-                    cleaned_line = line
-                    for prefix in ["$", ">", "#", "1.", "2.", "3.", "-", "•", "*"]:
-                        if line.startswith(prefix + " "):
-                            cleaned_line = line[len(prefix) :].strip()
-                            break
-
-                    for cmd_start in common_commands:
-                        if (
-                            cleaned_line.startswith(cmd_start + " ")
-                            or cleaned_line == cmd_start
-                        ):
-                            commands.append(
-                                {
-                                    "command": cleaned_line,
-                                    "reasoning": "Command extracted from AI response",
-                                }
-                            )
-                            break
-
-            # Pattern 3: Look for numbered commands
-            if not commands:
-                for line in lines:
-                    line = line.strip()
-                    # Match patterns like "1. curl ..." or "- curl ..."
-                    if re.match(
-                        r"^[\d\-\*\•]\s*\.?\s*(curl|wget|python|ls|cat|grep|find|nmap)",
-                        line,
-                        re.IGNORECASE,
-                    ):
-                        command_match = re.search(r"^[\d\-\*\•]\s*\.?\s*(.+)", line)
-                        if command_match:
-                            commands.append(
-                                {
-                                    "command": command_match.group(1).strip(),
-                                    "reasoning": "Numbered command extracted from AI response",
-                                }
-                            )
-
-            # Pattern 4: Look for JSON-like command patterns
-            if not commands:
-                for line in lines:
-                    line = line.strip()
-                    # Look for lines like '"command": "curl ..."' and extract just the command
-                    command_match = re.search(r'"command":\s*"([^"]+)"', line)
-                    if command_match:
-                        commands.append(
-                            {
-                                "command": command_match.group(1),
-                                "reasoning": "JSON command pattern extracted from AI response",
-                            }
-                        )
-                        continue
-
-                    # Look for other command patterns but exclude JSON structure
-                    if (
-                        line
-                        and not line.startswith(
-                            (
-                                "#",
-                                "//",
-                                "/*",
-                                "Note:",
-                                "First",
-                                "Next",
-                                "Then",
-                                "Let",
-                                "I will",
-                                "We should",
-                                '"command":',
-                                '"reasoning":',
-                            )
-                        )
-                        and (
-                            "http" in line
-                            or "--" in line
-                            or ".com" in line
-                            or "-v" in line
-                            or "-s" in line
-                        )
-                        and not line.startswith(("{", "}", "[", "]"))
-                    ):
-                        commands.append(
-                            {
-                                "command": line,
-                                "reasoning": "Pattern-matched command from AI response",
-                            }
-                        )
-
-            # If we still don't have commands, try to extract any reasonable looking command
-            if not commands:
-                for line in lines:
-                    line = line.strip()
-                    # Look for lines that look like shell commands
-                    if (
-                        line
-                        and not line.startswith("#")
-                        and ("/" in line or "-" in line or "=" in line)
-                        and len(line.split()) > 1
-                    ):
-                        commands.append(
-                            {
-                                "command": line,
-                                "reasoning": "Potential command extracted from response",
-                            }
-                        )
-
-            return commands[:3]  # Limit to first 3 commands to avoid too many at once
-
-        except Exception as e:
-            logger.error(f"Failed to parse AI response: {e}")
-            logger.error(f"Response was: {response[:500]}...")
-            return []
-
-    def _fix_partial_json(self, json_text: str) -> str:
-        """Attempt to fix partial or malformed JSON."""
-        # Remove any trailing incomplete entries
-        json_text = json_text.strip()
-
-        # Fix common sed command truncation issue first
-        import re
-
-        sed_fix_pattern = r'"command":\s*"([^"]*sed -n \'[^\']*)"'
-
-        def fix_sed_quotes(match):
-            command = match.group(1)
-            if (
-                command.count("'") % 2 == 1
-            ):  # Odd number of quotes, missing closing quote
-                command += "'"
-                logger.debug(f"Fixed truncated sed command in JSON: {command}")
-            return f'"command": "{command}"'
-
-        json_text = re.sub(sed_fix_pattern, fix_sed_quotes, json_text)
-
-        # If it ends with incomplete command entry, try to complete it
-        if json_text.endswith('"command"'):
-            # Truncated before the value, remove the incomplete entry
-            json_text = (
-                json_text.rsplit(",", 1)[0]
-                if "," in json_text
-                else json_text.rsplit("[", 1)[0] + "["
-            )
-        elif json_text.endswith('"command":'):
-            # Truncated after the colon, remove the incomplete entry
-            json_text = (
-                json_text.rsplit(",", 1)[0]
-                if "," in json_text
-                else json_text.rsplit("[", 1)[0] + "["
-            )
-        elif json_text.endswith('"command": "'):
-            # Truncated in the middle of command value, remove the incomplete entry
-            json_text = (
-                json_text.rsplit(",", 1)[0]
-                if "," in json_text
-                else json_text.rsplit("[", 1)[0] + "["
-            )
-
-        # If it doesn't end with ] or }, try to close the JSON properly
-        if not json_text.endswith(("]", "}")):
-            # Count open braces and brackets
-            open_braces = json_text.count("{") - json_text.count("}")
-            open_brackets = json_text.count("[") - json_text.count("]")
-
-            # Close any open structures
-            json_text += "}" * open_braces
-            json_text += "]" * open_brackets
-
-        # Fix common quote issues in commands
-        # If we have an odd number of quotes in a command value, it's likely truncated
-        command_pattern = r'"command":\s*"([^"]*)"'
-        matches = re.finditer(command_pattern, json_text)
-        for match in matches:
-            command_value = match.group(1)
-            # Check if command looks incomplete (ends with common command patterns)
-            if command_value.endswith((" |", " &&", " ||", " >", " <", " ;")):
-                # This looks like a truncated command, remove the incomplete part
-                truncated_pos = match.start()
-                json_text = json_text[:truncated_pos]
-                # Close the JSON properly
-                open_braces = json_text.count("{") - json_text.count("}")
-                open_brackets = json_text.count("[") - json_text.count("]")
-                json_text += "}" * open_braces
-                json_text += "]" * open_brackets
-                break
-
-        return json_text
-
-    # Auto-exploration removed for strict one-by-one flow
+Continue working toward finding the flag. {guidance} Propose exactly ONE next shell command with a short reasoning. If you just read a local file, avoid reprinting it fully; summarize and move on."""
 
     def _check_for_flag(
         self, actions: List[AgentAction], flag_format: str

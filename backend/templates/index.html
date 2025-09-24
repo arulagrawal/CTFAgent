@@ -98,6 +98,15 @@
                 </div>
 
                 <div>
+                    <label for="reasoning_effort" class="block text-sm font-medium text-gray-700 mb-1">Reasoning Effort</label>
+                    <select id="reasoning_effort" name="reasoning_effort"
+                            class="block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500">
+                        <option value="low" selected>Low</option>
+                        <option value="medium">Medium</option>
+                    </select>
+                </div>
+
+                <div>
                     <label for="description" class="block text-sm font-medium text-gray-700 mb-1">Description (optional)</label>
                     <textarea id="description" name="description" rows="3"
                               class="block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500"
@@ -351,6 +360,7 @@ async function handleFormSubmit(event) {
     const description = document.getElementById('description').value;
     const timeout = document.getElementById('timeout').value;
     const model = document.getElementById('model').value;
+    const reasoningEffort = document.getElementById('reasoning_effort').value;
     const handoutsInput = document.getElementById('handouts');
 
     if (targetType === 'url') {
@@ -375,6 +385,7 @@ async function handleFormSubmit(event) {
     if (description) formData.append('description', description);
     formData.append('timeout', timeout);
     formData.append('model', model);
+    formData.append('reasoning_effort', reasoningEffort);
     if (handoutsInput && handoutsInput.files && handoutsInput.files.length > 0) {
         for (let i = 0; i < handoutsInput.files.length; i++) {
             formData.append('handouts', handoutsInput.files[i]);
