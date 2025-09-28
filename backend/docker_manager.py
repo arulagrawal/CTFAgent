@@ -449,6 +449,21 @@ class DockerManager:
             finally:
                 del self.containers[session_id]
 
+        # Remove the named volume created for this session's workspace
+        try:
+            vol_name = f"ctf-workspace-{session_id}"
+            volume = self.client.volumes.get(vol_name)
+            try:
+                volume.remove(force=True)
+                logger.info(f"Removed volume {vol_name} for session {session_id}")
+            except Exception as ve:
+                logger.warning(
+                    f"Failed to remove volume {vol_name} for session {session_id}: {ve}"
+                )
+        except Exception:
+            # Volume may not exist; ignore
+            pass
+
     async def kill_container(self, session_id: str, remove: bool = True):
         """Immediately kill a running container (SIGKILL) and optionally remove it.
 
@@ -483,6 +498,23 @@ class DockerManager:
             try:
                 del self.containers[session_id]
             except Exception:
+                pass
+
+            # Attempt to remove the session's named volume as well
+            try:
+                vol_name = f"ctf-workspace-{session_id}"
+                volume = self.client.volumes.get(vol_name)
+                try:
+                    volume.remove(force=True)
+                    logger.info(
+                        f"Removed volume {vol_name} after kill for session {session_id}"
+                    )
+                except Exception as ve:
+                    logger.warning(
+                        f"Failed to remove volume {vol_name} after kill for session {session_id}: {ve}"
+                    )
+            except Exception:
+                # Volume may not exist; ignore
                 pass
 
     def get_container_logs(self, session_id: str, tail: int = 100) -> str:
