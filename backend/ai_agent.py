@@ -34,6 +34,8 @@ class CTFAgent:
         self._session_usage: Dict[str, Dict[str, Any]] = {}
         # Track last Responses API response.id per session for conversation state
         self._session_last_response_id: Dict[str, Optional[str]] = {}
+        # Track challenge type per session for tailored prompts
+        self._session_challenge_type: Dict[str, Optional[ChallengeType]] = {}
 
     def _init_usage(self, session_id: str) -> None:
         self._session_usage[session_id] = {
@@ -58,20 +60,15 @@ class CTFAgent:
             )
             usage = getattr(response, "usage", None)
             if not usage:
-                # Try alternative locations/shapes
-                usage = getattr(getattr(response, "choices", [{}])[0], "usage", None)
-            if not usage:
                 return
-            # Handle both Responses API and Chat Completions shapes
-            input_tokens = getattr(usage, "input_tokens", None)
-            if input_tokens is None:
-                input_tokens = getattr(usage, "prompt_tokens", 0)
-            output_tokens = getattr(usage, "output_tokens", None)
-            if output_tokens is None:
-                output_tokens = getattr(usage, "completion_tokens", 0)
-            total_tokens = getattr(usage, "total_tokens", None)
-            if total_tokens is None:
-                total_tokens = (input_tokens or 0) + (output_tokens or 0)
+            # Responses API usage fields
+            input_tokens = getattr(usage, "input_tokens", 0)
+            output_tokens = getattr(usage, "output_tokens", 0)
+            total_tokens = getattr(
+                usage,
+                "total_tokens",
+                (input_tokens or 0) + (output_tokens or 0),
+            )
 
             stats["requests"] += 1
             stats["input_tokens"] += int(input_tokens or 0)
@@ -301,10 +298,14 @@ class CTFAgent:
         try:
             # Initialize usage tracking
             self._init_usage(session_id)
+            # Store session challenge type for tailored prompts
+            self._session_challenge_type[session_id] = challenge_type
             # Set per-session reasoning effort (default low)
             try:
                 self._reasoning_effort = (
-                    str(reasoning_effort).lower() if reasoning_effort in ("low", "medium") else "low"
+                    str(reasoning_effort).lower()
+                    if reasoning_effort in ("low", "medium")
+                    else "low"
                 )
             except Exception:
                 self._reasoning_effort = "low"
@@ -477,18 +478,22 @@ class CTFAgent:
                     _kwargs["previous_response_id"] = prev_id
                 response = await self.client.responses.parse(
                     model=self.model,
-                    instructions=self._get_system_prompt(),
+                    instructions=self._get_system_prompt(session_id),
                     input=[{"role": "user", "content": input_text}],
                     max_output_tokens=10000,
                     reasoning={"effort": getattr(self, "_reasoning_effort", "low")},
                     text_format=SingleCommand,
+                    service_tier="flex",
                     **_kwargs,
                 )
+
                 # Track usage for Responses API
                 self._update_usage_from_response(session_id, response)
                 # Update last response id for conversation continuation
                 try:
-                    self._session_last_response_id[session_id] = getattr(response, "id", None)
+                    self._session_last_response_id[session_id] = getattr(
+                        response, "id", None
+                    )
                 except Exception:
                     pass
             except Exception as e:
@@ -505,153 +510,76 @@ class CTFAgent:
                     await callback("action", error_action.dict())
                 return actions
 
-            # Extract output text or structured parse
-            ai_response = None
-            try:
-                sc = getattr(response, "output_parsed", None)
-                if sc is not None and getattr(sc, "command", None):
-                    ai_response = json.dumps(
-                        {
-                            "command": sc.command,
-                            "reasoning": getattr(sc, "reasoning", "")
-                            or "No reasoning provided",
-                        }
-                    )
-            except Exception:
-                ai_response = None
-            if ai_response is None:
-                try:
-                    parts: List[str] = []
-                    for out in getattr(response, "output", []) or []:
-                        for content in getattr(out, "content", []) or []:
-                            if getattr(content, "type", None) in (
-                                "output_text",
-                                "text",
-                            ) and getattr(content, "text", None):
-                                parts.append(content.text)
-                    ai_response = "\n".join(parts)
-                except Exception:
-                    ai_response = ""
-
-            logger.info(f"AI Responses output length: {len(ai_response or '')}")
-
-            if not ai_response or ai_response.strip() == "":
-                logger.warning("AI returned empty response from Responses API")
+            # Use structured output directly (SingleCommand)
+            output = response.output_parsed
+            if not output:
+                logger.warning("AI returned empty structured command from Responses API")
                 error_action = AgentAction(
                     timestamp=datetime.now(timezone.utc),
                     action_type="ai_empty_response",
                     output="AI returned empty response using Responses API",
-                    reasoning="AI hit token limits or returned empty content",
+                    reasoning=(
+                        response.incomplete_details.reason
+                        if response.incomplete_details
+                        else f"No reasoning provided. Token usage: {response.usage.total_tokens if response.usage else 'unknown'}"
+                    ),
                     success=False,
                 )
                 actions.append(error_action)
                 if callback:
                     await callback("action", error_action.dict())
                 return actions
+            else:
+                command = output.command
+                reasoning = output.reasoning
 
-            # Parse AI response for a single command (prefer strict JSON)
-            try:
-                parsed = json.loads(ai_response)
-                commands = []
-                if isinstance(parsed, dict) and parsed.get("command"):
-                    commands = [
-                        {
-                            "command": str(parsed.get("command", "")).strip(),
-                            "reasoning": str(parsed.get("reasoning", "")).strip()
-                            or "No reasoning provided",
-                        }
-                    ]
-            except Exception:
-                pass
+            # Execute command in container
+            result = await self.docker_manager.execute_command(session_id, command)
 
-            # If no commands were parsed, log the full AI response for debugging
-            if not commands:
-                logger.warning(
-                    f"No commands extracted from AI response (length={len(ai_response or '')})."
+            # Enhanced output formatting with better observability
+            output_parts = []
+            output_parts.append(f"COMMAND: {command}")
+            output_parts.append(f"EXIT CODE: {result.get('exit_code', 'unknown')}")
+
+            if result.get("stdout"):
+                output_parts.append(f"STDOUT:\n{result['stdout']}")
+            else:
+                output_parts.append("STDOUT: (empty)")
+
+            if result.get("stderr"):
+                output_parts.append(f"STDERR:\n{result['stderr']}")
+            else:
+                output_parts.append("STDERR: (empty)")
+
+            # Add diagnostic info for failed commands
+            if not result["success"]:
+                output_parts.append(
+                    f"FAILURE REASON: Command exited with code {result.get('exit_code', 'unknown')}"
                 )
 
-                # Create a more informative action with the full AI response
-                error_action = AgentAction(
-                    timestamp=datetime.now(timezone.utc),
-                    action_type="ai_response_parsing_failed",
-                    output=f"AI provided response but no commands could be extracted.\n\nFull AI Response:\n{ai_response}",
-                    reasoning="The AI responded but the response format didn't match expected patterns for command extraction",
-                    success=False,
-                )
-                actions.append(error_action)
-                if callback:
-                    await callback("action", error_action.dict())
+                # Add container health check
+                container_status = await self._check_container_health(session_id)
+                if container_status:
+                    output_parts.append(f"CONTAINER STATUS: {container_status}")
 
-            # Execute only one command per step
-            for command_data in commands[:1]:
-                command = command_data.get("command", "")
-                reasoning = command_data.get("reasoning", "")
+            formatted_output = "\n\n".join(output_parts)
 
-                if not command or not command.strip():
-                    continue
+            action = AgentAction(
+                timestamp=datetime.now(timezone.utc),
+                action_type="command_execution",
+                command=command,
+                output=formatted_output,
+                reasoning=reasoning,
+                success=result["success"],
+            )
 
-                # Validate command doesn't contain clear JSON key artifacts
-                if any(
-                    artifact in command for artifact in ['"command":', '"reasoning":']
-                ):
-                    logger.warning(
-                        f"Skipping malformed command that still includes JSON keys: {command}"
-                    )
-                    continue
+            actions.append(action)
 
-                # Clean up any remaining quotes or artifacts (but preserve quotes inside the command)
-                command = command.strip('"{}[]')
+            if callback:
+                await callback("action", action.dict())
 
-                if not command or len(command.strip()) == 0:
-                    continue
-
-                # Execute command in container
-                result = await self.docker_manager.execute_command(session_id, command)
-
-                # Enhanced output formatting with better observability
-                output_parts = []
-                output_parts.append(f"COMMAND: {command}")
-                output_parts.append(f"EXIT CODE: {result.get('exit_code', 'unknown')}")
-
-                if result.get("stdout"):
-                    output_parts.append(f"STDOUT:\n{result['stdout']}")
-                else:
-                    output_parts.append("STDOUT: (empty)")
-
-                if result.get("stderr"):
-                    output_parts.append(f"STDERR:\n{result['stderr']}")
-                else:
-                    output_parts.append("STDERR: (empty)")
-
-                # Add diagnostic info for failed commands
-                if not result["success"]:
-                    output_parts.append(
-                        f"FAILURE REASON: Command exited with code {result.get('exit_code', 'unknown')}"
-                    )
-
-                    # Add container health check
-                    container_status = await self._check_container_health(session_id)
-                    if container_status:
-                        output_parts.append(f"CONTAINER STATUS: {container_status}")
-
-                formatted_output = "\n\n".join(output_parts)
-
-                action = AgentAction(
-                    timestamp=datetime.now(timezone.utc),
-                    action_type="command_execution",
-                    command=command,
-                    output=formatted_output,
-                    reasoning=reasoning,
-                    success=result["success"],
-                )
-
-                actions.append(action)
-
-                if callback:
-                    await callback("action", action.dict())
-
-                # Small delay to prevent overwhelming
-                await asyncio.sleep(0.5)
+            # Small delay to prevent overwhelming
+            await asyncio.sleep(0.5)
 
         except asyncio.CancelledError:
             # Propagate cancellation to stop immediately
@@ -671,38 +599,86 @@ class CTFAgent:
 
         return actions
 
-    def _get_system_prompt(self) -> str:
-        """Get the system prompt for the AI agent."""
-        return """You are an expert CTF challenge solver. Analyze the target and find the flag.
+    def _get_rev_guidance(self) -> str:
+        lines = [
+            "REVERSING TIPS:",
+            "- Identify file type: file, ldd, checksec.",
+            "- Inspect strings and symbols: strings -a, nm -D, readelf -a, objdump -d.",
+            "- Use radare2 or Ghidra headless for static analysis; avoid interactive sessions.",
+            "- Look for input checks, strcmp/memcmp, key derivations, and flag formatting functions.",
+            "- Grep for the flag format in binaries/handouts; search embedded resources.",
+            "- If obfuscated, dump sections, analyze control flow, and reconstruct constants with python3.",
+        ]
+        return "\n".join(lines)
 
-TOOLS AVAILABLE:
-curl, wget, python3, cat, grep, strings, base64, openssl, hashcat, john, binwalk, steghide, and pwntools (via python3), and many others.
+    def _get_pwn_guidance(self) -> str:
+        lines = [
+            "BINARY EXPLOITATION TIPS:",
+            "- Profile binary: file, checksec, pwn checksec, seccomp-tools if present.",
+            "- Probe inputs for crashes or leaks; prefer scripted fuzzing via python3/pwntools.",
+            # "- Use non-interactive tooling: gdb is not interactive here; instead, use gdb -batch -ex commands or pwndbg scripts to dump info.",
+            # "- Look for format strings, buffer overflows, UAF, and GOT/PLT opportunities.",
+            # "- Leak addresses to defeat ASLR; compute libc base with pwntools if libc present.",
+            # "- Build ROP chains with ROPgadget or ropper; assemble payloads in python3.",
+            "- For remote sockets, always script with pwntools; avoid netcat interactivity. Avoid long bruteforcing on the remote socket.",
+            "- With pwntools, always set timeouts: remote(host, port, timeout=20); conn.timeout = 20; recv/recvuntil(..., timeout=20).",
+            "- Leverage Python analysis libs: angr for symbolic execution/path finding and constraint solving; Capstone for disassembly (optionally Keystone/Unicorn).",
+            "- Try to focus on using angr to find the flag.",
+        ]
+        return "\n".join(lines)
 
-IMPORTANT:
-• Use /workspace for temporary files (not /tmp)
-• Commands with pipes/redirects are automatically wrapped in bash
-• Use actual targets (URLs or socket host:port), not placeholders like TARGET_URL or TARGET_HOST/TARGET_PORT
+    def _get_system_prompt(self, session_id: Optional[str] = None) -> str:
+        """Get the system prompt for the AI agent, tailored by challenge type and context."""
+        # Base tools
+        tools_block = (
+            "TOOLS AVAILABLE:\n"
+            "curl, wget, python3, cat, grep, strings, base64, openssl, hashcat, john, binwalk, steghide, and pwntools (via python3), and many others.\n"
+        )
 
-GENERAL STRATEGY (one step at a time):
-At each turn, propose exactly ONE shell command with a short reasoning.
-If a URL is provided, prioritize interacting with the live site (e.g., curl -sSLi ...).
-If a socket host:port is provided, do NOT assume HTTP. Interact using python3 with pwntools. Only use curl or HTTP tools if an HTTP banner/response explicitly confirms HTTP.
-For multi-step interactive sockets, prefer pwntools scripts saved under /workspace (e.g., /workspace/solve.py) and run with python3.
-If handouts are provided, use them to inform live interactions or solve handout-only challenges.
-If any handout is an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted (avoid re-extracting if already extracted).
+        # Non-interactive reminder
+        non_interactive = (
+            "NON-INTERACTIVE ENVIRONMENT:\n"
+            "You do not have an interactive TTY. Avoid launching interactive tools (e.g., gdb TUI, interactive shells).\n"
+            "If you need debugger output, use non-interactive modes (e.g., gdb -batch -ex '...' --args ./bin) or scripted analysis.\n"
+        )
 
-PYTHON JAIL STRATEGY (when interacting with Python REPL/jail):
-• Try quick escapes: breakpoint() to drop into pdb (then use !/!shell to run commands), help(), dir(), vars(), locals(), globals().
-• Leverage builtins: import builtins; builtins.__import__('os').system('sh'), or __import__('os').popen('sh').read().
-• Explore object graph: object.__subclasses__() to locate Popen or IO classes to execute commands/read files.
-• Bypass filters: build names dynamically (chr(), bytes, join) to avoid blacklists; consider non‑Unicode payloads.
-• For sockets, prefer pwntools; to send bytes, write small python3 scripts rather than echo.
+        # General guidance
+        general = (
+            "IMPORTANT:\n"
+            "• Use /workspace for temporary files (not /tmp)\n"
+            "• Commands with pipes/redirects are automatically wrapped in bash\n"
+            "• Use actual targets (URLs or socket host:port), not placeholders like TARGET_URL or TARGET_HOST/TARGET_PORT\n\n"
+            "GENERAL STRATEGY (one step at a time):\n"
+            "At each turn, propose exactly ONE shell command with a short reasoning.\n"
+            "If a URL is provided, prioritize interacting with the live site (e.g., curl -sSLi ...).\n"
+            "If a socket host:port is provided, do NOT assume HTTP. Interact using python3 with pwntools. Only use curl or HTTP tools if an HTTP banner/response explicitly confirms HTTP.\n"
+            "For multi-step interactive sockets, prefer pwntools scripts saved under /workspace (e.g., /workspace/solve.py) and run with python3.\n"
+            "If handouts are provided, use them to inform live interactions or solve handout-only challenges.\n"
+            "If any handout is an archive (.zip, .tar, .tar.gz, .tgz, .gz, .7z), extract it FIRST into /workspace/handouts/extracted (avoid re-extracting if already extracted).\n"
+        )
 
-IMPORTANT:
-Always extract archives first. Always look at the contents of the archive before trying to solve the challenge.
+        # Challenge-specific guidance
+        ct = self._session_challenge_type.get(session_id) if session_id else None
+        specific_blocks: List[str] = []
+        if ct == ChallengeType.REVERSE:
+            specific_blocks.append(self._get_rev_guidance())
+        if ct == ChallengeType.PWNABLE:
+            specific_blocks.append(self._get_pwn_guidance())
+        # Only include Python jail tips if context indicates pyjail; handled dynamically in analysis/iteration prompts
 
-RESPONSE FORMAT:
-Return exactly one shell command and a short reasoning."""
+        tail = (
+            "\nRESPONSE FORMAT:\n"
+            "Return exactly one shell command and a short reasoning."
+        )
+
+        return (
+            "You are an expert CTF challenge solver. Analyze the target and find the flag.\n\n"
+            + tools_block
+            + non_interactive
+            + general
+            + ("\n\n".join(specific_blocks) + ("\n" if specific_blocks else ""))
+            + tail
+        )
 
     def _build_analysis_prompt(
         self,
@@ -744,7 +720,7 @@ Return exactly one shell command and a short reasoning."""
             )
         if socket_host and socket_port:
             guidance_lines.append(
-                "This is a socket challenge: do NOT assume HTTP. Use python3 with pwntools. Only switch to HTTP tooling if an HTTP response is confirmed. Consider banner grabbing and protocol exploration."
+                "This is a socket challenge: do NOT assume HTTP. Use python3 with pwntools (set connection and read timeouts). Only switch to HTTP tooling if an HTTP response is confirmed. Consider banner grabbing and protocol exploration."
             )
         if not url and not (socket_host and socket_port):
             guidance_lines.append(
@@ -846,7 +822,7 @@ Start analyzing this challenge to find the flag. Propose exactly ONE shell comma
             )
         if socket_host and socket_port:
             guidance_lines.append(
-                "Socket target: do NOT assume HTTP. Use python3 with pwntools; Only use HTTP tools if HTTP is confirmed."
+                "Socket target: do NOT assume HTTP. Use python3 with pwntools and set timeouts (e.g., remote(host, port, timeout=20)); Only use HTTP tools if HTTP is confirmed."
             )
         if not url and not (socket_host and socket_port):
             guidance_lines.append(

@@ -80,6 +80,7 @@ try:
 except Exception as e:
     logger.error(f"Failed to initialize AI agent: {e}")
     ai_agent = None
+    exit(1)
 
 
 class WebSocketManager:
@@ -274,9 +275,7 @@ async def stop_challenge(session_id: str):
         # 1) Hard-kill the container immediately (non-blocking)
         try:
             if ai_agent:
-                asyncio.create_task(
-                    ai_agent.docker_manager.kill_container(session_id)
-                )
+                asyncio.create_task(ai_agent.docker_manager.kill_container(session_id))
         except Exception as e:
             logger.warning(
                 f"Failed to schedule container kill for session {session_id}: {e}"
