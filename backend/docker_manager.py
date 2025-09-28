@@ -189,7 +189,9 @@ class DockerManager:
             # Check container status before execution
             container.reload()
             if container.status != "running":
-                await on_chunk("stderr", f"Container is not running (status: {container.status})\n")
+                await on_chunk(
+                    "stderr", f"Container is not running (status: {container.status})\n"
+                )
                 return {
                     "exit_code": -1,
                     "stdout": "",
@@ -201,7 +203,9 @@ class DockerManager:
             logger.info(f"Executing (stream) in {session_id}: {command}")
 
             # Execute command - use shell for complex commands with pipes, &&, etc.
-            needs_shell = any(op in command for op in ["&&", "||", "|", ">", "<", ";", "$(", "`"])
+            needs_shell = any(
+                op in command for op in ["&&", "||", "|", ">", "<", ";", "$(", "`"]
+            )
             if needs_shell:
                 exec_command = ["/bin/bash", "-lc", command]
             else:
@@ -227,22 +231,30 @@ class DockerManager:
                     )["Id"]
 
                     # Start streaming
-                    stream = self.client.api.exec_start(exec_id, stream=True, demux=True)
+                    stream = self.client.api.exec_start(
+                        exec_id, stream=True, demux=True
+                    )
                     for out, err in stream:
                         if out:
                             text = out.decode("utf-8", errors="replace")
                             stdout_acc.append(text)
-                            _asyncio.run_coroutine_threadsafe(on_chunk("stdout", text), loop)
+                            _asyncio.run_coroutine_threadsafe(
+                                on_chunk("stdout", text), loop
+                            )
                         if err:
                             text = err.decode("utf-8", errors="replace")
                             stderr_acc.append(text)
-                            _asyncio.run_coroutine_threadsafe(on_chunk("stderr", text), loop)
+                            _asyncio.run_coroutine_threadsafe(
+                                on_chunk("stderr", text), loop
+                            )
 
                     info = self.client.api.exec_inspect(exec_id)
                     code = info.get("ExitCode", -1)
                     return int(code if code is not None else -1)
                 except Exception as e:
-                    _asyncio.run_coroutine_threadsafe(on_chunk("stderr", f"Execution error: {e}\n"), loop)
+                    _asyncio.run_coroutine_threadsafe(
+                        on_chunk("stderr", f"Execution error: {e}\n"), loop
+                    )
                     return -1
 
             exit_code: int = await _asyncio.to_thread(_run_and_stream)
@@ -293,8 +305,12 @@ class DockerManager:
                 user="root",
                 demux=True,
             )
-            uid_out = uid_res.output[0].decode("utf-8").strip() if uid_res.output else "1000"
-            gid_out = gid_res.output[0].decode("utf-8").strip() if gid_res.output else "1000"
+            uid_out = (
+                uid_res.output[0].decode("utf-8").strip() if uid_res.output else "1000"
+            )
+            gid_out = (
+                gid_res.output[0].decode("utf-8").strip() if gid_res.output else "1000"
+            )
             uid = int(uid_out or 1000)
             gid = int(gid_out or 1000)
         except Exception:

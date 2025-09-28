@@ -39,6 +39,9 @@ RUN apt-get update && apt-get install -y \
     gdb llvm
     # && rm -rf /var/lib/apt/lists/*
 
+RUN apt-get install -y \
+    postgresql-client 
+
 # Set objdump to llvm-objdump (for multiarch support)
 RUN update-alternatives --install /usr/bin/objdump objdump /usr/bin/llvm-objdump 100
 

@@ -385,6 +385,7 @@ async def solve_challenge_background_form(
                 # Ensure id presence
                 if not getattr(action, "id", None):
                     import uuid as _uuid
+
                     action.id = _uuid.uuid4().hex
                 session.actions.append(action)
                 session.updated_at = datetime.now(timezone.utc)

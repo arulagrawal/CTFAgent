@@ -518,7 +518,9 @@ class CTFAgent:
             # Use structured output directly (SingleCommand)
             output = response.output_parsed
             if not output:
-                logger.warning("AI returned empty structured command from Responses API")
+                logger.warning(
+                    "AI returned empty structured command from Responses API"
+                )
                 error_action = AgentAction(
                     timestamp=datetime.now(timezone.utc),
                     action_type="ai_empty_response",
