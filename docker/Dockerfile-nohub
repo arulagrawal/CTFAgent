@@ -1,0 +1,103 @@
+# CTF Agent Docker Image (No Docker Hub base)
+# This container includes tools commonly used in CTF challenges
+# Base image pulled from AWS Public ECR to avoid Docker Hub
+
+FROM public.ecr.aws/ubuntu/ubuntu:24.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+# Install system packages and dependencies
+RUN apt-get update && apt-get install -y \
+    # Basic utilities
+    curl wget git vim nano tree file \
+    sed \
+    # Network tools
+    nmap netcat-openbsd telnet dnsutils \
+    # Web tools
+    # burpsuite-pro-free gobuster dirb nikto \
+    # Programming languages
+    python3 python3-pip python3-dev \
+    nodejs npm \
+    # Cryptography tools
+    openssl hashcat john \
+    # Reverse engineering tools
+    binutils  \
+    # Forensics tools
+    binwalk foremost\
+    # Steganography tools
+    steghide \
+    # Database tools
+    # sqlite3 mysql-client postgresql-client \
+    # Compression tools
+    unzip p7zip-full \
+    # Build tools
+    # gcc g++ make cmake \
+    # Other useful tools
+    jq xmlstarlet \
+    gdb llvm
+    # && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get install -y \
+    postgresql-client 
+
+# Set objdump to llvm-objdump (for multiarch support)
+RUN update-alternatives --install /usr/bin/objdump objdump /usr/bin/llvm-objdump 100
+
+# Install Python packages commonly used in CTFs
+RUN pip3 install --no-cache-dir --break-system-packages \
+    requests beautifulsoup4 \
+    pycryptodome cryptography \
+    pillow \
+    z3-solver \
+    pwntools \
+    scapy \
+    paramiko \
+    sqlparse \
+    lxml \
+    numpy scipy \
+    flask flask-unsign flask-unsign-wordlist itsdangerous \
+    angr capstone
+    # jupyter \
+
+# # Install additional tools via pip
+# RUN pip3 install --no-cache-dir \
+#     flask django \
+#     selenium \
+#     scrapy \
+#     base58 \
+#     qrcode
+
+# Install Node.js packages
+RUN npm install -g \
+    js-beautify \
+    eslint \
+    @babel/core @babel/cli
+
+# # Install additional reverse engineering tools
+# RUN wget -O /tmp/ghidra.zip https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_10.4_build/ghidra_10.4_20230928_linux_x86_64.zip \
+#     && unzip /tmp/ghidra.zip -d /opt/ \
+#     && mv /opt/ghidra_* /opt/ghidra \
+#     && rm /tmp/ghidra.zip
+
+# Create workspace directory
+RUN mkdir -p /workspace
+WORKDIR /workspace
+
+# Create a non-root user for security
+RUN useradd -m -s /bin/bash ctfuser && \
+    chown -R ctfuser:ctfuser /workspace
+
+# Set up environment
+ENV PATH="/opt/ghidra:${PATH}"
+ENV GHIDRA_INSTALL_DIR="/opt/ghidra"
+ENV TERM=xterm
+
+# Switch to non-root user
+USER ctfuser
+
+# Default command
+CMD ["/bin/bash"]
+
+

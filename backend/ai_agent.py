@@ -4,6 +4,7 @@ import re
 import json
 from typing import List, Dict, Any, Optional, Callable
 import os
+import uuid
 from datetime import datetime, timezone
 from openai import AsyncOpenAI
 
@@ -202,44 +203,44 @@ class CTFAgent:
         actions: List[AgentAction],
     ) -> bool:
         """Heuristically detect if this looks like a Python jail/REPL challenge."""
-        try:
-            desc = (description or "").lower()
-            indicators = [
-                "pyjail",
-                "python jail",
-                "python repl",
-                "repl",
-                "sandbox",
-                "builtins",
-                "__import__",
-                ">>>",
-                "traceback",
-                "nameerror",
-                "pdb",
-            ]
-            if any(tok in desc for tok in indicators):
-                return True
-            for name in uploaded_files:
-                n = (name or "").lower()
-                if n.endswith(".py") or ("jail" in n and "py" in n):
-                    return True
-            # Look at recent outputs for Python prompts/errors
-            for action in actions[-5:]:
-                out = (action.output or "").lower()
-                if any(
-                    tok in out
-                    for tok in [
-                        ">>>",
-                        "traceback (most recent call last)",
-                        "nameerror",
-                        "attributeerror",
-                        "builtins",
-                        "pdb",
-                    ]
-                ):
-                    return True
-        except Exception:
-            pass
+        # try:
+        #     desc = (description or "").lower()
+        #     indicators = [
+        #         "pyjail",
+        #         "python jail",
+        #         "python repl",
+        #         "repl",
+        #         "sandbox",
+        #         "builtins",
+        #         "__import__",
+        #         ">>>",
+        #         "traceback",
+        #         "nameerror",
+        #         "pdb",
+        #     ]
+        #     if any(tok in desc for tok in indicators):
+        #         return True
+        #     for name in uploaded_files:
+        #         n = (name or "").lower()
+        #         if n.endswith(".py") or ("jail" in n and "py" in n):
+        #             return True
+        #     # Look at recent outputs for Python prompts/errors
+        #     for action in actions[-5:]:
+        #         out = (action.output or "").lower()
+        #         if any(
+        #             tok in out
+        #             for tok in [
+        #                 ">>>",
+        #                 "traceback (most recent call last)",
+        #                 "nameerror",
+        #                 "attributeerror",
+        #                 "builtins",
+        #                 "pdb",
+        #             ]
+        #         ):
+        #             return True
+        # except Exception:
+        #     pass
         return False
 
     def _get_pyjail_guidance(self) -> str:
@@ -389,7 +390,7 @@ class CTFAgent:
                     flag_action = AgentAction(
                         timestamp=datetime.now(timezone.utc),
                         action_type="flag_found",
-                        output=f"Flag found: {flag}",
+                        output=f"{flag}",
                         reasoning="Flag pattern matched in previous outputs",
                         success=True,
                     )
@@ -472,6 +473,8 @@ class CTFAgent:
 
             # Call Responses API with structured output (SingleCommand) and conversation state
             try:
+                if callback:
+                    await callback("ai_status", {"thinking": True})
                 prev_id = self._session_last_response_id.get(session_id)
                 _kwargs = {}
                 if prev_id:
@@ -480,12 +483,14 @@ class CTFAgent:
                     model=self.model,
                     instructions=self._get_system_prompt(session_id),
                     input=[{"role": "user", "content": input_text}],
-                    max_output_tokens=10000,
+                    max_output_tokens=2**14,
                     reasoning={"effort": getattr(self, "_reasoning_effort", "low")},
                     text_format=SingleCommand,
                     service_tier="flex",
                     **_kwargs,
                 )
+                if callback:
+                    await callback("ai_status", {"thinking": False})
 
                 # Track usage for Responses API
                 self._update_usage_from_response(session_id, response)
@@ -513,7 +518,9 @@ class CTFAgent:
             # Use structured output directly (SingleCommand)
             output = response.output_parsed
             if not output:
-                logger.warning("AI returned empty structured command from Responses API")
+                logger.warning(
+                    "AI returned empty structured command from Responses API"
+                )
                 error_action = AgentAction(
                     timestamp=datetime.now(timezone.utc),
                     action_type="ai_empty_response",
@@ -533,53 +540,83 @@ class CTFAgent:
                 command = output.command
                 reasoning = output.reasoning
 
-            # Execute command in container
-            result = await self.docker_manager.execute_command(session_id, command)
+            # Create action placeholder and stream output
+            action_id = uuid.uuid4().hex
+            stdout_acc: List[str] = []
+            stderr_acc: List[str] = []
 
-            # Enhanced output formatting with better observability
+            action = AgentAction(
+                id=action_id,
+                timestamp=datetime.now(timezone.utc),
+                action_type="command_execution",
+                command=command,
+                output="",
+                reasoning=reasoning,
+                success=True,
+            )
+            actions.append(action)
+            if callback:
+                await callback("action_create", action.dict())
+
+            async def on_chunk(channel: str, text: str):
+                if channel == "stdout":
+                    stdout_acc.append(text)
+                else:
+                    stderr_acc.append(text)
+                if callback:
+                    await callback(
+                        "action_chunk",
+                        {"id": action_id, "channel": channel, "chunk": text},
+                    )
+
+            result = await self.docker_manager.execute_command_stream(
+                session_id, command, on_chunk
+            )
+
+            # Build final formatted output for persistence and post-processing
             output_parts = []
             output_parts.append(f"COMMAND: {command}")
             output_parts.append(f"EXIT CODE: {result.get('exit_code', 'unknown')}")
 
-            if result.get("stdout"):
-                output_parts.append(f"STDOUT:\n{result['stdout']}")
+            stdout_full = "".join(stdout_acc)
+            stderr_full = "".join(stderr_acc)
+
+            if stdout_full:
+                output_parts.append(f"STDOUT:\n{stdout_full}")
             else:
                 output_parts.append("STDOUT: (empty)")
 
-            if result.get("stderr"):
-                output_parts.append(f"STDERR:\n{result['stderr']}")
+            if stderr_full:
+                output_parts.append(f"STDERR:\n{stderr_full}")
             else:
                 output_parts.append("STDERR: (empty)")
 
-            # Add diagnostic info for failed commands
             if not result["success"]:
                 output_parts.append(
                     f"FAILURE REASON: Command exited with code {result.get('exit_code', 'unknown')}"
                 )
-
-                # Add container health check
                 container_status = await self._check_container_health(session_id)
                 if container_status:
                     output_parts.append(f"CONTAINER STATUS: {container_status}")
 
             formatted_output = "\n\n".join(output_parts)
 
-            action = AgentAction(
-                timestamp=datetime.now(timezone.utc),
-                action_type="command_execution",
-                command=command,
-                output=formatted_output,
-                reasoning=reasoning,
-                success=result["success"],
-            )
-
-            actions.append(action)
+            action.output = formatted_output
+            action.success = bool(result.get("success"))
 
             if callback:
-                await callback("action", action.dict())
+                await callback(
+                    "action_complete",
+                    {
+                        "id": action_id,
+                        "success": action.success,
+                        "exit_code": result.get("exit_code"),
+                        "final_output": formatted_output,
+                    },
+                )
 
             # Small delay to prevent overwhelming
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.2)
 
         except asyncio.CancelledError:
             # Propagate cancellation to stop immediately

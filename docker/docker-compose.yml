@@ -25,7 +25,7 @@ services:
   ctf-solver-image:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile-nohub
     image: ctf-agent:latest
     command: /bin/true  # Exit immediately after build
     networks:
