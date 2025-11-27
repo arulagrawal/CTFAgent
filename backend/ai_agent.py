@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 # Substrings that invalidate a matched flag candidate (case-insensitive)
-FLAG_CANDIDATE_BANNED_SUBSTRINGS = ("fake", "redacted")
+FLAG_CANDIDATE_BANNED_SUBSTRINGS = ("fake", "redacted", "test")
 
 
 class SingleCommand(BaseModel):

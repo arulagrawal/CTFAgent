@@ -7,6 +7,7 @@ from docker.models.containers import Container
 import json
 import uuid
 from pprint import pprint
+import shlex
 
 logger = logging.getLogger(__name__)
 
@@ -122,8 +123,8 @@ class DockerManager:
                 exec_command = ["/bin/bash", "-c", command]
                 logger.debug(f"Using shell execution: {exec_command}")
             else:
-                # Simple command can be executed directly
-                exec_command = command
+                # Simple command can be executed directly, split safely
+                exec_command = shlex.split(command)
                 logger.debug(f"Using direct execution: {exec_command}")
 
             exec_result = container.exec_run(
@@ -209,7 +210,7 @@ class DockerManager:
             if needs_shell:
                 exec_command = ["/bin/bash", "-lc", command]
             else:
-                exec_command = command
+                exec_command = shlex.split(command)
 
             stdout_acc: list[str] = []
             stderr_acc: list[str] = []

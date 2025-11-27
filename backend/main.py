@@ -28,6 +28,7 @@ from .models import (
     ChallengeRequest,
     ChallengeSession,
     ChallengeStatus,
+    ChallengeType,
     AgentAction,
     WebSocketMessage,
 )
@@ -149,6 +150,12 @@ async def start_challenge(
             status_code=400,
             detail="Provide a URL, or a host+port, or at least one handout.",
         )
+
+    # Validate flag regex early
+    try:
+        re.compile(flag_format)
+    except re.error as e:
+        raise HTTPException(status_code=400, detail=f"Invalid flag regex: {e}")
 
     # Create session
     session = ChallengeSession(
@@ -294,7 +301,7 @@ async def stop_challenge(session_id: str):
                 session_id=session_id,
                 data={"status": session.status, "error": session.error_message},
             )
-            await websocket_manager.send_message(session_id, cancel_message)
+            asyncio.create_task(websocket_manager.send_message(session_id, cancel_message))
         except Exception as e:
             logger.debug(f"WebSocket notify on stop failed for {session_id}: {e}")
 
@@ -408,7 +415,7 @@ async def solve_challenge_background_form(
 
         message = WebSocketMessage(type=event_type, session_id=session_id, data=data)
         logger.info(f"Sending WebSocket message: {event_type} for session {session_id}")
-        await websocket_manager.send_message(session_id, message)
+        asyncio.create_task(websocket_manager.send_message(session_id, message))
 
     try:
         # Start solving
@@ -442,13 +449,22 @@ async def solve_challenge_background_form(
                 ai_agent.model = model
         except Exception:
             pass
+        # Normalize challenge type string to enum when possible
+        ct_enum = None
+        try:
+            if challenge_type:
+                # Accept case-insensitive input matching enum values
+                ct_enum = ChallengeType(challenge_type.lower())
+        except Exception:
+            ct_enum = None
+
         actions = await ai_agent.solve_challenge(
             session_id=session_id,
             challenge_url=str(url) if url else None,
             socket_host=host,
             socket_port=port,
             flag_format=flag_format,
-            challenge_type=challenge_type,  # type: ignore[arg-type]
+            challenge_type=ct_enum,  # type: ignore[arg-type]
             description=description,
             uploaded_files=session.uploaded_files,
             callback=websocket_callback,
@@ -494,13 +510,15 @@ async def solve_challenge_background_form(
                 usage_action = ai_agent.build_usage_summary_action(session_id)
                 if usage_action:
                     session.actions.append(usage_action)
-                    await websocket_manager.send_message(
-                        session_id,
-                        WebSocketMessage(
-                            type="action",
-                            session_id=session_id,
-                            data=usage_action.dict(),
-                        ),
+                    asyncio.create_task(
+                        websocket_manager.send_message(
+                            session_id,
+                            WebSocketMessage(
+                                type="action",
+                                session_id=session_id,
+                                data=usage_action.dict(),
+                            ),
+                        )
                     )
                     # Extract and store cost on session
                     if usage_action.output:
@@ -526,7 +544,7 @@ async def solve_challenge_background_form(
                 session_id=session_id,
                 data={"status": session.status, "error": session.error_message},
             )
-            await websocket_manager.send_message(session_id, cancel_message)
+            asyncio.create_task(websocket_manager.send_message(session_id, cancel_message))
         except Exception:
             pass
         raise
@@ -550,7 +568,7 @@ async def solve_challenge_background_form(
         error_message = WebSocketMessage(
             type="error", session_id=session_id, data={"error": str(e)}
         )
-        await websocket_manager.send_message(session_id, error_message)
+        asyncio.create_task(websocket_manager.send_message(session_id, error_message))
 
     finally:
         # Clean up container
