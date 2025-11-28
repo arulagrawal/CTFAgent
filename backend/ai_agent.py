@@ -10,6 +10,7 @@ from openai import AsyncOpenAI
 
 from .models import AgentAction, ChallengeType
 from .docker_manager import DockerManager
+from .llm_models import get_model_info, get_api_string, is_valid_model, get_available_models
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -26,8 +27,14 @@ class SingleCommand(BaseModel):
 
 class CTFAgent:
     def __init__(self, openai_api_key: str, model: str = "gpt-5-mini"):
+        # Validate and normalize model name
+        if not is_valid_model(model):
+            available_models = ', '.join(get_available_models().keys())
+            logger.warning(f"Unknown model '{model}', using as-is. Available models: {available_models}")
         self.client = AsyncOpenAI(api_key=openai_api_key)
+        # Store the original model name for display, but use API string for API calls
         self.model = model
+        self.api_string = get_api_string(model)
         self.docker_manager = DockerManager()
         self._ensured_handout_dir: Dict[str, bool] = {}
         self._session_handouts: Dict[str, List[str]] = {}
@@ -84,16 +91,17 @@ class CTFAgent:
         if not stats:
             return None
         try:
-            model_name = str(stats.get("model", self.model)).lower()
-            # Default to gpt-5 pricing unless explicitly mini
-            if "mini" in model_name or model_name.replace(" ", "").replace(
-                "_", "-"
-            ) in ("gpt-5-mini", "gpt5-mini"):
-                price_in = 0.250  # USD per 1M input tokens
-                price_out = 2.000  # USD per 1M output tokens
-            else:
+            model_name = str(stats.get("model", self.model))
+            model_info = get_model_info(model_name)
+            
+            if not model_info:
+                # Fallback to default pricing if model not found
+                logger.warning(f"Model '{model_name}' not found in registry, using default pricing")
                 price_in = 1.250  # USD per 1M input tokens
                 price_out = 10.000  # USD per 1M output tokens
+            else:
+                price_in = model_info.price_input_per_1m
+                price_out = model_info.price_output_per_1m
 
             cost = (stats["input_tokens"] / 1_000_000) * price_in + (
                 stats["output_tokens"] / 1_000_000
@@ -480,7 +488,7 @@ class CTFAgent:
                 if prev_id:
                     _kwargs["previous_response_id"] = prev_id
                 response = await self.client.responses.parse(
-                    model=self.model,
+                    model=self.api_string,
                     instructions=self._get_system_prompt(session_id),
                     input=[{"role": "user", "content": input_text}],
                     max_output_tokens=2**14,

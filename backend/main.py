@@ -34,6 +34,7 @@ from .models import (
 )
 from .ai_agent import CTFAgent
 from .docker_manager import DockerManager
+from .llm_models import is_valid_model, get_api_string, get_available_models
 
 # Load environment variables
 load_dotenv()
@@ -76,8 +77,13 @@ try:
     if not openai_api_key:
         raise ValueError("OPENAI_API_KEY environment variable is required")
 
+    model_from_env = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+    if not is_valid_model(model_from_env):
+        logger.warning(f"Invalid model '{model_from_env}' from OPENAI_MODEL env var, using 'gpt-5-mini'")
+        model_from_env = "gpt-5-mini"
+
     ai_agent = CTFAgent(
-        openai_api_key=openai_api_key, model=os.getenv("OPENAI_MODEL", "gpt-5-mini")
+        openai_api_key=openai_api_key, model=model_from_env
     )
 except Exception as e:
     logger.error(f"Failed to initialize AI agent: {e}")
@@ -156,6 +162,14 @@ async def start_challenge(
         re.compile(flag_format)
     except re.error as e:
         raise HTTPException(status_code=400, detail=f"Invalid flag regex: {e}")
+
+    # Validate model name
+    if not is_valid_model(model):
+        available_models = ', '.join(get_available_models().keys())
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid model '{model}'. Available models: {available_models}"
+        )
 
     # Create session
     session = ChallengeSession(
@@ -447,6 +461,7 @@ async def solve_challenge_background_form(
         try:
             if model:
                 ai_agent.model = model
+                ai_agent.api_string = get_api_string(model)
         except Exception:
             pass
         # Normalize challenge type string to enum when possible
