@@ -1,26 +1,110 @@
+const templateFlagFormat = readTemplateFlagFormat();
 let currentSession = null;
 let websocket = null;
 let startTime = null;
+let pollIntervalId = null;
+let pollTimeoutId = null;
+let lastAppliedFlagDefault = null;
+let flagFormatTouched = false;
+let flagPreferenceInitialized = false;
+let serverFlagFormat = templateFlagFormat;
+
+function readTemplateFlagFormat() {
+    if (typeof document !== 'undefined') {
+        const input = document.getElementById('flag_format');
+        if (input && input.dataset && input.dataset.defaultFlag) {
+            return input.dataset.defaultFlag;
+        }
+    }
+    return 'flag{.+}';
+}
 
 // Initialize the application
 document.addEventListener('DOMContentLoaded', function () {
     checkApiHealth();
     setupEventListeners();
+    initFlagFormatPreference();
+    hydrateFromQueryParams();
 });
 
 function setupEventListeners() {
-    document.getElementById('challenge-form').addEventListener('submit', handleFormSubmit);
-    document.getElementById('stop-btn').addEventListener('click', stopChallenge);
-    document.getElementById('delete-btn').addEventListener('click', deleteSession);
-    document.getElementById('handout-upload-btn').addEventListener('click', uploadHandouts);
-    document.getElementById('target_type').addEventListener('change', onTargetTypeChange);
-    document.getElementById('toggle-form-btn').addEventListener('click', toggleChallengeForm);
+    const form = document.getElementById('challenge-form');
+    if (!form) {
+        return;
+    }
+
+    form.addEventListener('submit', handleFormSubmit);
+
+    const stopBtn = document.getElementById('stop-btn');
+    if (stopBtn) stopBtn.addEventListener('click', stopChallenge);
+
+    const deleteBtn = document.getElementById('delete-btn');
+    if (deleteBtn) deleteBtn.addEventListener('click', deleteSession);
+
+    const uploadBtn = document.getElementById('handout-upload-btn');
+    if (uploadBtn) uploadBtn.addEventListener('click', uploadHandouts);
+
+    const targetSelect = document.getElementById('target_type');
+    if (targetSelect) targetSelect.addEventListener('change', onTargetTypeChange);
+
+    const toggleBtn = document.getElementById('toggle-form-btn');
+    if (toggleBtn) toggleBtn.addEventListener('click', toggleChallengeForm);
+
     const hostEl = document.getElementById('host');
     if (hostEl) {
         hostEl.addEventListener('paste', onHostPaste);
         hostEl.addEventListener('change', onHostChange);
     }
+
+    const flagInput = document.getElementById('flag_format');
+    if (flagInput) {
+        flagInput.addEventListener('input', () => {
+            flagFormatTouched = flagInput.value !== lastAppliedFlagDefault;
+        });
+    }
+
     onTargetTypeChange();
+}
+
+function hydrateFromQueryParams() {
+    const params = new URLSearchParams(window.location.search);
+    const sessionId = params.get('session');
+    if (sessionId) {
+        loadExistingSession(sessionId.trim());
+    } else {
+        clearPersistedSessionId();
+    }
+}
+
+async function loadExistingSession(sessionId) {
+    if (!sessionId) return;
+    try {
+        setLoading(true);
+        hideError();
+        showSessionLoadingState(sessionId);
+        const response = await fetch(`/challenges/${sessionId}`);
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.detail || 'Session not found');
+        }
+        const session = await response.json();
+        currentSession = session;
+
+        adjustLayoutForActiveSession();
+        updateSessionStatus(session);
+        persistSessionId(sessionId);
+        updateUrlWithSession(sessionId);
+        await fetchActions(sessionId);
+        setupWebSocket(sessionId);
+        startPolling(sessionId).catch((err) => {
+            console.error('Polling error', err);
+        });
+    } catch (error) {
+        console.error('Failed to hydrate session', error);
+        showError(error.message || 'Failed to load session');
+    } finally {
+        setLoading(false);
+    }
 }
 
 async function checkApiHealth() {
@@ -82,7 +166,9 @@ function onHostChange(event) {
 }
 
 function onTargetTypeChange() {
-    const type = document.getElementById('target_type').value;
+    const targetSelect = document.getElementById('target_type');
+    if (!targetSelect) return;
+    const type = targetSelect.value;
     const urlBlock = document.getElementById('url-input-block');
     const socketBlock = document.getElementById('socket-input-block');
     const urlInput = document.getElementById('url');
@@ -173,6 +259,8 @@ async function handleFormSubmit(event) {
 
         const data = await response.json();
         currentSession = { session_id: data.session_id };
+        persistSessionId(data.session_id);
+        updateUrlWithSession(data.session_id);
 
         // Clear previous flag display
         document.getElementById('flag-found').classList.add('hidden');
@@ -214,7 +302,15 @@ async function handleFormSubmit(event) {
 }
 
 function setupWebSocket(sessionId) {
-    const wsUrl = `ws://${window.location.host}/ws/${sessionId}`;
+    if (websocket) {
+        try {
+            websocket.close();
+        } catch (err) {
+            console.warn('Failed to close previous WebSocket', err);
+        }
+    }
+    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsUrl = `${protocol}://${window.location.host}/ws/${sessionId}`;
     websocket = new WebSocket(wsUrl);
 
     websocket.onopen = function () {
@@ -266,6 +362,10 @@ function handleWebSocketMessage(message) {
         case 'status':
             if (currentSession) {
                 updateSessionStatus({ ...currentSession, ...message.data });
+                if (message.data.session_id) {
+                    persistSessionId(message.data.session_id);
+                    updateUrlWithSession(message.data.session_id);
+                }
             }
             break;
         case 'ai_status':
@@ -274,19 +374,29 @@ function handleWebSocketMessage(message) {
     }
 }
 
+function stopPolling() {
+    if (pollIntervalId) {
+        clearInterval(pollIntervalId);
+        pollIntervalId = null;
+    }
+    if (pollTimeoutId) {
+        clearTimeout(pollTimeoutId);
+        pollTimeoutId = null;
+    }
+}
+
 async function startPolling(sessionId) {
-    // Initial fetch
+    stopPolling();
     await fetchSessionStatus(sessionId);
     await fetchActions(sessionId);
 
-    // Poll every 2 seconds for 30 seconds
-    const pollInterval = setInterval(async () => {
+    pollIntervalId = setInterval(async () => {
         await fetchSessionStatus(sessionId);
         await fetchActions(sessionId);
     }, 2000);
 
-    setTimeout(() => {
-        clearInterval(pollInterval);
+    pollTimeoutId = setTimeout(() => {
+        stopPolling();
     }, 30000);
 }
 
@@ -670,6 +780,7 @@ async function deleteSession() {
                 live.classList.add('invisible');
                 live.classList.remove('hidden');
             }
+            stopPolling();
             resetLayoutAfterSession();
             if (websocket) {
                 websocket.close();
@@ -686,6 +797,9 @@ async function deleteSession() {
 function setLoading(loading) {
     const startBtn = document.getElementById('start-btn');
     const startText = document.getElementById('start-text');
+    if (!startBtn || !startText) {
+        return;
+    }
 
     if (loading) {
         startBtn.disabled = true;
@@ -695,6 +809,90 @@ function setLoading(loading) {
         startBtn.disabled = false;
         startBtn.classList.remove('opacity-50', 'cursor-not-allowed');
         startText.textContent = 'Start Challenge';
+    }
+}
+
+function showSessionLoadingState(sessionId) {
+    const sessionStatusEl = document.getElementById('session-status');
+    if (sessionStatusEl) {
+        sessionStatusEl.classList.remove('hidden', 'invisible');
+    }
+    const sessionIdEl = document.getElementById('session-id');
+    if (sessionIdEl) {
+        sessionIdEl.textContent = sessionId;
+    }
+    const actionLog = document.getElementById('action-log');
+    if (actionLog) {
+        actionLog.innerHTML = '<div class="flex items-center justify-center flex-1"><p class="text-gray-500 text-center text-sm">Loading session log…</p></div>';
+    }
+}
+
+function updateUrlWithSession(sessionId) {
+    if (!sessionId || typeof history === 'undefined' || !history.replaceState) {
+        return;
+    }
+    const url = new URL(window.location.href);
+    url.searchParams.set('session', sessionId);
+    history.replaceState({}, '', url.toString());
+}
+
+function initFlagFormatPreference() {
+    if (flagPreferenceInitialized) {
+        return;
+    }
+    flagPreferenceInitialized = true;
+    refreshFlagFormatFromServer();
+}
+
+function applyFlagFormatDefault(value) {
+    const input = document.getElementById('flag_format');
+    if (!input) return;
+    const sanitized = value && value.trim() ? value.trim() : templateFlagFormat;
+    if (flagFormatTouched && input.value !== lastAppliedFlagDefault) {
+        return;
+    }
+    input.value = sanitized;
+    lastAppliedFlagDefault = sanitized;
+    flagFormatTouched = false;
+}
+
+async function refreshFlagFormatFromServer() {
+    try {
+        const response = await fetch('/settings/flag-format');
+        if (!response.ok) {
+            throw new Error('Failed to load default flag format');
+        }
+        const data = await response.json();
+        serverFlagFormat = (data.flag_format || templateFlagFormat).trim();
+        applyFlagFormatDefault(serverFlagFormat);
+    } catch (err) {
+        console.warn('Unable to fetch default flag format', err);
+        applyFlagFormatDefault(templateFlagFormat);
+    }
+}
+
+function persistSessionId(sessionId) {
+    try {
+        window.localStorage.setItem('currentSessionId', sessionId);
+    } catch (err) {
+        console.warn('Unable to persist session id', err);
+    }
+}
+
+function getPersistedSessionId() {
+    try {
+        return window.localStorage.getItem('currentSessionId');
+    } catch (err) {
+        console.warn('Unable to read persisted session id', err);
+        return null;
+    }
+}
+
+function clearPersistedSessionId() {
+    try {
+        window.localStorage.removeItem('currentSessionId');
+    } catch (err) {
+        console.warn('Unable to clear session id', err);
     }
 }
 
@@ -813,6 +1011,9 @@ function resetLayoutAfterSession() {
     const challengeForm = document.getElementById('challenge-form');
     const collapseIcon = document.getElementById('collapse-icon');
     const expandIcon = document.getElementById('expand-icon');
+
+    // Stop any background polling to avoid unnecessary network calls
+    stopPolling();
 
     // Keep active layout to avoid jank when sessions start/stop
     mainGrid.className = 'grid grid-cols-1 xl:grid-cols-5 gap-4 flex-1';

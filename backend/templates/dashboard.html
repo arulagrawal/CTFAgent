@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard · CTF Agent{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+    <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+        <div>
+            <h2 class="text-2xl font-semibold text-gray-900">Challenge Dashboard</h2>
+            <p class="text-sm text-gray-500">Monitor every session in one place. Stop runaway jobs, jump into a session, or grab a flag without hunting for the right tab.</p>
+        </div>
+        <div class="flex items-center space-x-2">
+            <button id="refresh-btn" class="inline-flex items-center px-4 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium bg-white text-gray-700 hover:bg-gray-50 transition">
+                <svg class="w-4 h-4 mr-2 text-gray-500" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M4.06189 13C4.02104 12.6724 4 12.3387 4 12C4 7.58172 7.58172 4 12 4C14.5006 4 16.7332 5.14727 18.2002 6.94416M19.9381 11C19.979 11.3276 20 11.6613 20 12C20 16.4183 16.4183 20 12 20C9.61061 20 7.46589 18.9525 6 17.2916M9 17H6V17.2916M18.2002 4V6.94416M18.2002 6.94416V6.99993L15.2002 7M6 20V17.2916" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                Refresh
+            </button>
+            <a href="/" class="inline-flex items-center px-4 py-2 rounded-md text-sm font-medium bg-primary-600 text-white hover:bg-primary-700 transition">
+                Launch New Session
+            </a>
+            <div class="relative">
+                <details id="flag-format-popover" class="flag-format-popover">
+                    <summary class="inline-flex items-center px-3 py-2 rounded-md border border-gray-200 bg-white text-xs font-medium text-gray-700 cursor-pointer select-none gap-2 list-none">
+                        <svg class="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7h18M3 12h18M3 17h18"/>
+                        </svg>
+                        Flag Default
+                    </summary>
+                    <div class="absolute right-0 mt-2 w-72 bg-white border border-gray-200 rounded-lg shadow-lg p-4 space-y-3 z-20">
+                        <div class="text-xs text-gray-500">
+                            Applied to new challenges when the main page loads.
+                        </div>
+                        <input id="default-flag-format" type="text" placeholder="SCF2024-[A-Za-z0-9-_]{10,}"
+                               class="w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500 text-sm px-3 py-2" />
+                        <div class="flex items-center justify-between">
+                            <span id="flag-format-status" class="text-xs text-green-600 hidden">Saved!</span>
+                            <button id="flag-format-save-btn"
+                                    class="ml-auto inline-flex items-center justify-center px-3 py-1.5 rounded-md text-xs font-medium bg-primary-600 text-white hover:bg-primary-700 transition">
+                                Save default
+                            </button>
+                        </div>
+                    </div>
+                </details>
+            </div>
+        </div>
+    </div>
+    <style>
+        details.flag-format-popover summary::-webkit-details-marker {
+            display: none;
+        }
+    </style>
+
+    <div id="dashboard-error" class="hidden p-3 rounded-md border border-red-200 bg-red-50 text-sm text-red-700"></div>
+
+    <div class="bg-white shadow-sm border border-gray-200 rounded-lg">
+        <div class="flex items-center justify-between px-4 py-3 border-b">
+            <div class="flex items-center space-x-2 text-sm text-gray-500">
+                <span class="inline-flex items-center text-xs px-2.5 py-0.5 rounded-full bg-green-50 text-green-700">
+                    <span class="w-2 h-2 rounded-full bg-green-500 mr-2"></span>
+                    Running
+                </span>
+                <span class="inline-flex items-center text-xs px-2.5 py-0.5 rounded-full bg-blue-50 text-blue-700">
+                    <span class="w-2 h-2 rounded-full bg-blue-500 mr-2"></span>
+                    Completed
+                </span>
+                <span class="inline-flex items-center text-xs px-2.5 py-0.5 rounded-full bg-yellow-50 text-yellow-700">
+                    <span class="w-2 h-2 rounded-full bg-yellow-500 mr-2"></span>
+                    Pending
+                </span>
+                <span class="inline-flex items-center text-xs px-2.5 py-0.5 rounded-full bg-red-50 text-red-700">
+                    <span class="w-2 h-2 rounded-full bg-red-500 mr-2"></span>
+                    Failed/Stopped
+                </span>
+            </div>
+            <div class="flex items-center text-sm text-gray-500 space-x-2">
+                <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+                <span>Auto-refresh every 5s</span>
+            </div>
+        </div>
+
+        <div class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-gray-200">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                        <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Session</th>
+                        <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Target</th>
+                        <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Flag</th>
+                        <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Created</th>
+                        <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Updated</th>
+                        <th scope="col" class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="sessions-body" class="bg-white divide-y divide-gray-200">
+                </tbody>
+            </table>
+        </div>
+
+        <div id="empty-state" class="hidden px-6 py-12 flex flex-col items-center text-center text-gray-500">
+            <svg class="w-12 h-12 text-gray-300 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path>
+            </svg>
+            <p class="text-base font-medium text-gray-900">No sessions yet</p>
+            <p class="text-sm text-gray-500 mt-1">Launch a challenge and it will appear here instantly.</p>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/dashboard.js?v={{ STATIC_VERSION }}"></script>
+{% endblock %}
+

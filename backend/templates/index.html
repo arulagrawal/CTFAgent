@@ -76,7 +76,12 @@
                         </svg>
                         Flag Format (regex)
                     </label>
-                    <input type="text" id="flag_format" name="flag_format" required value="flag{.+}"
+                    <input type="text"
+                           id="flag_format"
+                           name="flag_format"
+                           required
+                           value="{{ default_flag_format }}"
+                           data-default-flag="{{ default_flag_format }}"
                            class="block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500"
                            placeholder="flag{.+}">
                     <p class="text-xs text-gray-500 mt-1">
@@ -286,4 +291,4 @@
 
 {% endblock %}
 
-{% block scripts %}{% endblock %}
+{% block scripts %}{{ super() }}{% endblock %}

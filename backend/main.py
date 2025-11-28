@@ -22,7 +22,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse
+from fastapi.encoders import jsonable_encoder
+from pathlib import Path
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 from .models import (
     ChallengeRequest,
@@ -35,6 +38,43 @@ from .models import (
 from .ai_agent import CTFAgent
 from .docker_manager import DockerManager
 from .llm_models import is_valid_model, get_api_string, get_available_models
+
+DEFAULT_FLAG_FORMAT = "SCF2024-[A-Za-z0-9-_]{10,}"
+FLAG_FORMAT_PATH = Path("data/settings/flag_format.txt")
+flag_format_lock = asyncio.Lock()
+
+
+def _ensure_flag_format_path():
+    FLAG_FORMAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _load_flag_format_from_disk() -> str:
+    try:
+        if FLAG_FORMAT_PATH.exists():
+            value = FLAG_FORMAT_PATH.read_text(encoding="utf-8").strip()
+            return value or DEFAULT_FLAG_FORMAT
+    except Exception as e:
+        logger.warning(f"Failed to load flag format from disk: {e}")
+    return DEFAULT_FLAG_FORMAT
+
+
+def _save_flag_format_to_disk(value: str):
+    try:
+        _ensure_flag_format_path()
+        FLAG_FORMAT_PATH.write_text(value, encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to persist flag format: {e}")
+
+
+current_flag_format = _load_flag_format_from_disk()
+
+
+def get_current_flag_format() -> str:
+    return current_flag_format or DEFAULT_FLAG_FORMAT
+
+
+class FlagFormatUpdate(BaseModel):
+    flag_format: str
 
 # Load environment variables
 load_dotenv()
@@ -64,6 +104,10 @@ app.add_middleware(
 # Setup templates and static files
 templates = Jinja2Templates(directory="backend/templates")
 app.mount("/static", StaticFiles(directory="backend/static"), name="static")
+
+
+STATIC_VERSION = os.getenv("STATIC_VERSION") or str(int(datetime.now(timezone.utc).timestamp()))
+templates.env.globals["STATIC_VERSION"] = STATIC_VERSION
 
 # Global state
 sessions: Dict[str, ChallengeSession] = {}
@@ -119,7 +163,19 @@ websocket_manager = WebSocketManager()
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(
+        "index.html",
+        {"request": request, "default_flag_format": get_current_flag_format()},
+    )
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    """Render the multi-session dashboard."""
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {"request": request, "default_flag_format": get_current_flag_format()},
+    )
 
 
 @app.get("/health")
@@ -131,12 +187,46 @@ async def health_check():
     }
 
 
+@app.get("/challenges")
+async def list_challenges(status: ChallengeStatus | None = None):
+    """Return all challenge sessions, optionally filtered by status."""
+    items = list(sessions.values())
+    if status:
+        items = [session for session in items if session.status == status]
+
+    # Sort by newest first for easier scanning on the dashboard
+    items.sort(key=lambda s: s.updated_at, reverse=True)
+    return {"sessions": jsonable_encoder(items)}
+
+
+@app.get("/settings/flag-format")
+async def get_flag_format_setting():
+    return {"flag_format": get_current_flag_format()}
+
+
+@app.post("/settings/flag-format")
+async def update_flag_format_setting(payload: FlagFormatUpdate):
+    global current_flag_format
+    value = (payload.flag_format or "").strip() or DEFAULT_FLAG_FORMAT
+    try:
+        re.compile(value)
+    except re.error as e:
+        raise HTTPException(status_code=400, detail=f"Invalid flag regex: {e}")
+
+    async with flag_format_lock:
+        current_flag_format = value
+        _save_flag_format_to_disk(value)
+
+    logger.info(f"Updated default flag format to: {value}")
+    return {"flag_format": current_flag_format}
+
+
 @app.post("/challenges/start")
 async def start_challenge(
     url: str | None = Form(None),
     host: str | None = Form(None),
     port: int | None = Form(None),
-    flag_format: str = Form("flag{.*}"),
+    flag_format: str | None = Form(None),
     challenge_type: str | None = Form(None),
     description: str | None = Form(None),
     timeout: int = Form(300),
@@ -158,6 +248,9 @@ async def start_challenge(
         )
 
     # Validate flag regex early
+    if not flag_format:
+        flag_format = get_current_flag_format()
+
     try:
         re.compile(flag_format)
     except re.error as e:
@@ -274,7 +367,7 @@ async def get_challenge_status(session_id: str):
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    return sessions[session_id]
+    return jsonable_encoder(sessions[session_id])
 
 
 @app.get("/challenges/{session_id}/actions")
@@ -283,7 +376,7 @@ async def get_challenge_actions(session_id: str):
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    return {"actions": sessions[session_id].actions}
+    return {"actions": jsonable_encoder(sessions[session_id].actions)}
 
 
 @app.post("/challenges/{session_id}/stop")
