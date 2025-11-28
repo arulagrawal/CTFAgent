@@ -7,6 +7,7 @@ from docker.models.containers import Container
 import json
 import uuid
 from pprint import pprint
+import shlex
 
 logger = logging.getLogger(__name__)
 
@@ -122,8 +123,8 @@ class DockerManager:
                 exec_command = ["/bin/bash", "-c", command]
                 logger.debug(f"Using shell execution: {exec_command}")
             else:
-                # Simple command can be executed directly
-                exec_command = command
+                # Simple command can be executed directly, split safely
+                exec_command = shlex.split(command)
                 logger.debug(f"Using direct execution: {exec_command}")
 
             exec_result = container.exec_run(
@@ -209,7 +210,7 @@ class DockerManager:
             if needs_shell:
                 exec_command = ["/bin/bash", "-lc", command]
             else:
-                exec_command = command
+                exec_command = shlex.split(command)
 
             stdout_acc: list[str] = []
             stderr_acc: list[str] = []
@@ -449,6 +450,21 @@ class DockerManager:
             finally:
                 del self.containers[session_id]
 
+        # Remove the named volume created for this session's workspace
+        try:
+            vol_name = f"ctf-workspace-{session_id}"
+            volume = self.client.volumes.get(vol_name)
+            try:
+                volume.remove(force=True)
+                logger.info(f"Removed volume {vol_name} for session {session_id}")
+            except Exception as ve:
+                logger.warning(
+                    f"Failed to remove volume {vol_name} for session {session_id}: {ve}"
+                )
+        except Exception:
+            # Volume may not exist; ignore
+            pass
+
     async def kill_container(self, session_id: str, remove: bool = True):
         """Immediately kill a running container (SIGKILL) and optionally remove it.
 
@@ -483,6 +499,23 @@ class DockerManager:
             try:
                 del self.containers[session_id]
             except Exception:
+                pass
+
+            # Attempt to remove the session's named volume as well
+            try:
+                vol_name = f"ctf-workspace-{session_id}"
+                volume = self.client.volumes.get(vol_name)
+                try:
+                    volume.remove(force=True)
+                    logger.info(
+                        f"Removed volume {vol_name} after kill for session {session_id}"
+                    )
+                except Exception as ve:
+                    logger.warning(
+                        f"Failed to remove volume {vol_name} after kill for session {session_id}: {ve}"
+                    )
+            except Exception:
+                # Volume may not exist; ignore
                 pass
 
     def get_container_logs(self, session_id: str, tail: int = 100) -> str:

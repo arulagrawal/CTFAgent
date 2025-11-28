@@ -1,4 +1,4 @@
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
 from enum import Enum
@@ -49,11 +49,11 @@ class ChallengeSession(BaseModel):
     status: ChallengeStatus
     created_at: datetime
     updated_at: datetime
-    actions: List[AgentAction] = []
+    actions: List[AgentAction] = Field(default_factory=list)
     found_flag: Optional[str] = None
     container_id: Optional[str] = None
     error_message: Optional[str] = None
-    uploaded_files: List[str] = []  # Filenames available in /workspace/handouts
+    uploaded_files: List[str] = Field(default_factory=list)  # Filenames available in /workspace/handouts
     estimated_cost_usd: Optional[float] = None
 
 

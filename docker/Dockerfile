@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y \
     # Basic utilities
     curl wget git vim nano tree file \
     sed \
+    vim-common \
+    openjdk-17-jdk \
     # Network tools
     nmap netcat-openbsd telnet dnsutils \
     # Web tools
