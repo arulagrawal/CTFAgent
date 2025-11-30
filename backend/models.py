@@ -26,8 +26,9 @@ class ChallengeRequest(BaseModel):
     port: Optional[int] = None
     flag_format: str = "flag{.*}"
     challenge_type: Optional[ChallengeType] = None
+    challenge_name: Optional[str] = None
     description: Optional[str] = None
-    timeout: int = 300  # 5 minutes default
+    timeout: int = 600  # 10 minutes default
 
 
 class AgentAction(BaseModel):
@@ -45,6 +46,7 @@ class ChallengeSession(BaseModel):
     challenge_url: Optional[str] = None
     host: Optional[str] = None
     port: Optional[int] = None
+    challenge_name: Optional[str] = None
     flag_format: str
     status: ChallengeStatus
     created_at: datetime

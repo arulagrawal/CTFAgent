@@ -228,8 +228,9 @@ async def start_challenge(
     port: int | None = Form(None),
     flag_format: str | None = Form(None),
     challenge_type: str | None = Form(None),
+    challenge_name: str | None = Form(None),
     description: str | None = Form(None),
-    timeout: int = Form(300),
+    timeout: int = Form(600),
     model: str = Form("gpt-5-mini"),
     reasoning_effort: str = Form("low"),
     handouts: List[UploadFile] | None = None,
@@ -269,12 +270,17 @@ async def start_challenge(
     if reasoning_effort_value not in REASONING_EFFORT_CHOICES:
         reasoning_effort_value = REASONING_EFFORT_CHOICES[0]
 
+    # Normalize timeout with sane bounds
+    timeout_value = timeout or 600
+    timeout_value = max(60, min(int(timeout_value), 1800))
+
     # Create session
     session = ChallengeSession(
         session_id=session_id,
         challenge_url=str(url) if url else None,
         host=host,
         port=port,
+        challenge_name=challenge_name.strip() if challenge_name else None,
         flag_format=flag_format,
         found_flag=None,
         status=ChallengeStatus.PENDING,
@@ -310,8 +316,9 @@ async def start_challenge(
             port,
             flag_format,
             challenge_type,
+            challenge_name,
             description,
-            timeout,
+        timeout_value,
             model,
             reasoning_effort_value,
         )
@@ -485,12 +492,15 @@ async def solve_challenge_background_form(
     port: int | None,
     flag_format: str,
     challenge_type: str | None,
+    challenge_name: str | None,
     description: str | None,
     timeout: int,
     model: str,
     reasoning_effort: str,
 ):
     """Background task to solve challenge."""
+    timeout = timeout or 600
+    timeout = max(1, timeout)
     session = sessions[session_id]
     session.status = ChallengeStatus.RUNNING
     session.updated_at = datetime.now(timezone.utc)
@@ -555,13 +565,6 @@ async def solve_challenge_background_form(
                 except Exception as e:
                     logger.warning(f"Error copying handout {name} before start: {e}")
 
-        # Update model per-session if frontend selected a specific model
-        try:
-            if model:
-                ai_agent.model = model
-                ai_agent.api_string = get_api_string(model)
-        except Exception:
-            pass
         # Normalize challenge type string to enum when possible
         ct_enum = None
         try:
@@ -571,17 +574,23 @@ async def solve_challenge_background_form(
         except Exception:
             ct_enum = None
 
-        actions = await ai_agent.solve_challenge(
-            session_id=session_id,
-            challenge_url=str(url) if url else None,
-            socket_host=host,
-            socket_port=port,
-            flag_format=flag_format,
-            challenge_type=ct_enum,  # type: ignore[arg-type]
-            description=description,
-            uploaded_files=session.uploaded_files,
-            callback=websocket_callback,
-            reasoning_effort=reasoning_effort,
+        actions = await asyncio.wait_for(
+            ai_agent.solve_challenge(
+                session_id=session_id,
+                challenge_url=str(url) if url else None,
+                socket_host=host,
+                socket_port=port,
+                flag_format=flag_format,
+                challenge_type=ct_enum,  # type: ignore[arg-type]
+                challenge_name=challenge_name,
+                description=description,
+                uploaded_files=session.uploaded_files,
+                callback=websocket_callback,
+                reasoning_effort=reasoning_effort,
+                model=model,
+                session_timeout=timeout,
+            ),
+            timeout=timeout,
         )
 
         # Update session with results
@@ -611,6 +620,63 @@ async def solve_challenge_background_form(
         else:
             session.status = ChallengeStatus.FAILED
             session.error_message = "Flag not found within time limit"
+
+    except asyncio.TimeoutError:
+        logger.error(f"Challenge solving timed out for session {session_id}")
+        session.status = ChallengeStatus.FAILED
+        session.error_message = f"Timed out after {timeout} seconds"
+        session.updated_at = datetime.now(timezone.utc)
+
+        timeout_action = AgentAction(
+            timestamp=datetime.now(timezone.utc),
+            action_type="session_timeout",
+            output=f"Session timed out after {timeout} seconds.",
+            reasoning="Global session timeout reached",
+            success=False,
+        )
+        session.actions.append(timeout_action)
+        asyncio.create_task(
+            websocket_manager.send_message(
+                session_id,
+                WebSocketMessage(
+                    type="action",
+                    session_id=session_id,
+                    data=timeout_action.dict(),
+                ),
+            )
+        )
+        asyncio.create_task(
+            websocket_manager.send_message(
+                session_id,
+                WebSocketMessage(
+                    type="status",
+                    session_id=session_id,
+                    data={"status": session.status, "error": session.error_message},
+                ),
+            )
+        )
+
+        try:
+            if ai_agent:
+                usage_action = ai_agent.build_usage_summary_action(session_id)
+                if usage_action:
+                    session.actions.append(usage_action)
+                    asyncio.create_task(
+                        websocket_manager.send_message(
+                            session_id,
+                            WebSocketMessage(
+                                type="action",
+                                session_id=session_id,
+                                data=usage_action.dict(),
+                            ),
+                        )
+                    )
+                    if usage_action.output:
+                        m = re.search(r"Estimated cost: \$(\d+\.\d+)", usage_action.output)
+                        if m:
+                            session.estimated_cost_usd = float(m.group(1))
+        except Exception:
+            pass
 
     except asyncio.CancelledError:
         logger.info(f"Background solving cancelled for session {session_id}")
@@ -690,6 +756,11 @@ async def solve_challenge_background_form(
                 await ai_agent.docker_manager.cleanup_container(session_id)
         except Exception as e:
             logger.error(f"Failed to cleanup container for session {session_id}: {e}")
+        try:
+            if ai_agent:
+                ai_agent.clear_session_state(session_id)
+        except Exception as e:
+            logger.error(f"Failed to clear session state for {session_id}: {e}")
         # Remove task from registry if present
         background_tasks.pop(session_id, None)
 

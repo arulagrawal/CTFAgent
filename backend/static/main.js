@@ -209,6 +209,7 @@ async function handleFormSubmit(event) {
     const flagFormat = document.getElementById('flag_format').value;
     const challengeType = document.getElementById('challenge_type').value;
     const description = document.getElementById('description').value;
+    const challengeName = document.getElementById('challenge_name')?.value || '';
     const timeout = document.getElementById('timeout').value;
     const model = document.getElementById('model').value;
     const reasoningEffort = document.getElementById('reasoning_effort').value;
@@ -234,6 +235,7 @@ async function handleFormSubmit(event) {
     formData.append('flag_format', flagFormat);
     if (challengeType) formData.append('challenge_type', challengeType);
     if (description) formData.append('description', description);
+    if (challengeName) formData.append('challenge_name', challengeName);
     formData.append('timeout', timeout);
     formData.append('model', model);
     formData.append('reasoning_effort', reasoningEffort);
@@ -428,6 +430,15 @@ function updateSessionStatus(session) {
     currentSession = session;
 
     document.getElementById('session-id').textContent = session.session_id;
+    const nameRow = document.getElementById('challenge-name-row');
+    const nameValue = document.getElementById('challenge-name-value');
+    if (session.challenge_name) {
+        if (nameRow) nameRow.classList.remove('hidden');
+        if (nameValue) nameValue.textContent = session.challenge_name;
+    } else {
+        if (nameRow) nameRow.classList.add('hidden');
+        if (nameValue) nameValue.textContent = '';
+    }
     const urlBlock = document.getElementById('url-status-block');
     const socketBlock = document.getElementById('socket-status-block');
     const urlEl = document.getElementById('challenge-url');

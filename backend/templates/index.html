@@ -142,6 +142,13 @@
                 </div>
 
                 <div>
+                    <label for="challenge_name" class="block text-sm font-medium text-gray-700 mb-1">Challenge Name (optional)</label>
+                    <input type="text" id="challenge_name" name="challenge_name"
+                           class="block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500"
+                           placeholder="Web 200 - SQLi Challenge">
+                </div>
+
+                <div>
                     <label for="description" class="block text-sm font-medium text-gray-700 mb-1">Description (optional)</label>
                     <textarea id="description" name="description" rows="3"
                               class="block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500"
@@ -150,7 +157,7 @@
 
                 <div>
                     <label for="timeout" class="block text-sm font-medium text-gray-700 mb-1">Timeout (seconds)</label>
-                    <input type="number" id="timeout" name="timeout" min="60" max="1800" value="300"
+                    <input type="number" id="timeout" name="timeout" min="60" max="1800" value="600"
                            class="block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500">
                 </div>
 
@@ -202,6 +209,10 @@
                         <span class="text-gray-500">Estimated Cost:</span>
                         <div id="estimated-cost" class="font-mono">—</div>
                     </div>
+                </div>
+                <div id="challenge-name-row" class="text-sm hidden">
+                    <span class="text-gray-500">Challenge Name:</span>
+                    <div id="challenge-name-value" class="font-medium text-gray-900 mt-1"></div>
                 </div>
 
                 <div id="url-status-block" class="hidden">

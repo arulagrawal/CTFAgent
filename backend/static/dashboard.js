@@ -55,14 +55,16 @@ function renderSessions(sessions) {
         const row = document.createElement('tr');
         row.className = 'hover:bg-gray-50 transition';
         const safeSessionId = escapeHtml(session.session_id);
+        const safeChallengeName = escapeHtml(session.challenge_name || '');
         const safeType = escapeHtml(session.challenge_type || 'auto');
         row.innerHTML = `
             <td class="px-4 py-3 whitespace-nowrap">
                 ${renderStatusBadge(session.status)}
             </td>
-            <td class="px-4 py-3 text-sm font-mono text-gray-900">
-                ${truncate(safeSessionId, 12)}
-                <div class="text-xs text-gray-500">${safeSessionId}</div>
+            <td class="px-4 py-3 text-sm text-gray-900">
+                ${safeChallengeName ? `<div class="text-sm font-semibold text-gray-900">${truncate(safeChallengeName, 32)}</div>` : ''}
+                <div class="font-mono">${truncate(safeSessionId, 12)}</div>
+                <div class="text-xs text-gray-500 font-mono">${safeSessionId}</div>
             </td>
             <td class="px-4 py-3">
                 <div class="text-sm text-gray-900">${formatTarget(session)}</div>

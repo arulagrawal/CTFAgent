@@ -2,7 +2,7 @@ import asyncio
 import logging
 import re
 import json
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, cast
 import os
 import uuid
 from datetime import datetime, timezone
@@ -11,6 +11,7 @@ from openai import AsyncOpenAI
 from .models import AgentAction, ChallengeType
 from .docker_manager import DockerManager
 from .llm_models import get_model_info, get_api_string, is_valid_model, get_available_models
+from .session import Session
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -34,65 +35,63 @@ class CTFAgent:
             logger.warning(f"Unknown model '{model}', using as-is. Available models: {available_models}")
         self.client = AsyncOpenAI(api_key=openai_api_key)
         # Store the original model name for display, but use API string for API calls
-        self.model = model
-        self.api_string = get_api_string(model)
+        self.default_model = model
+        self.model = self.default_model  # Backwards compatibility
+        self.default_api_string = get_api_string(model)
+        self.api_string = self.default_api_string  # Backwards compatibility
         self.docker_manager = DockerManager()
-        self._ensured_handout_dir: Dict[str, bool] = {}
-        self._session_handouts: Dict[str, List[str]] = {}
-        # Track OpenAI usage per session
-        self._session_usage: Dict[str, Dict[str, Any]] = {}
-        # Track last Responses API response.id per session for conversation state
-        self._session_last_response_id: Dict[str, Optional[str]] = {}
-        # Track challenge type per session for tailored prompts
-        self._session_challenge_type: Dict[str, Optional[ChallengeType]] = {}
+        self.sessions: Dict[str, Session] = {}
 
-    def _init_usage(self, session_id: str) -> None:
-        self._session_usage[session_id] = {
-            "model": self.model,
-            "requests": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-        }
+    def _get_session(self, session_id: str) -> Optional[Session]:
+        return self.sessions.get(session_id)
+
+    def _create_session(
+        self,
+        session_id: str,
+        model_name: Optional[str],
+        reasoning_effort: Optional[str],
+        timeout_seconds: Optional[int],
+        challenge_type: Optional[ChallengeType],
+        uploaded_files: Optional[List[str]],
+        challenge_name: Optional[str],
+    ) -> Session:
+        selected_model = str(model_name or self.default_model)
+        api_string = get_api_string(selected_model)
+        session = Session(
+            session_id=session_id,
+            model=selected_model,
+            api_string=api_string,
+            challenge_type=challenge_type,
+            challenge_name=challenge_name.strip() if challenge_name else None,
+        )
+        session.set_reasoning_effort(
+            reasoning_effort, REASONING_EFFORT_CHOICES, REASONING_EFFORT_CHOICES[0]
+        )
+        session.set_deadline(timeout_seconds)
+        session.set_handouts(uploaded_files or [])
+        session.reset_usage()
+        self.sessions[session_id] = session
+        return session
+
+    def clear_session_state(self, session_id: str) -> None:
+        """Drop cached per-session state after completion."""
+        self.sessions.pop(session_id, None)
 
     def _update_usage_from_response(self, session_id: str, response: Any) -> None:
-        try:
-            stats = self._session_usage.setdefault(
-                session_id,
-                {
-                    "model": self.model,
-                    "requests": 0,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "total_tokens": 0,
-                },
-            )
-            usage = getattr(response, "usage", None)
-            if not usage:
-                return
-            # Responses API usage fields
-            input_tokens = getattr(usage, "input_tokens", 0)
-            output_tokens = getattr(usage, "output_tokens", 0)
-            total_tokens = getattr(
-                usage,
-                "total_tokens",
-                (input_tokens or 0) + (output_tokens or 0),
-            )
-
-            stats["requests"] += 1
-            stats["input_tokens"] += int(input_tokens or 0)
-            stats["output_tokens"] += int(output_tokens or 0)
-            stats["total_tokens"] += int(total_tokens or 0)
-        except Exception:
-            # Best effort; ignore errors in metering
-            pass
+        session = self._get_session(session_id)
+        if session:
+            session.update_usage_from_response(response)
 
     def _estimate_cost_usd(self, session_id: str) -> Optional[float]:
-        stats = self._session_usage.get(session_id)
+        session = self._get_session(session_id)
+        if not session:
+            return None
+
+        stats = session.usage
         if not stats:
             return None
         try:
-            model_name = str(stats.get("model", self.model))
+            model_name = str(stats.get("model", session.model))
             model_info = get_model_info(model_name)
             
             if not model_info:
@@ -112,13 +111,14 @@ class CTFAgent:
             return None
 
     def _build_usage_summary_action(self, session_id: str) -> Optional[AgentAction]:
-        stats = self._session_usage.get(session_id)
-        if not stats:
+        session = self._get_session(session_id)
+        if not session or not session.usage:
             return None
+        stats = session.usage
         estimated_cost = self._estimate_cost_usd(session_id)
         cost_str = f"${estimated_cost:.6f}" if estimated_cost is not None else "N/A"
         summary = (
-            f"Usage summary for model {stats.get('model', self.model)}\n"
+            f"Usage summary for model {stats.get('model', session.model)}\n"
             f"Requests: {stats.get('requests', 0)}\n"
             f"Input tokens: {stats.get('input_tokens', 0)}\n"
             f"Output tokens: {stats.get('output_tokens', 0)}\n"
@@ -138,11 +138,15 @@ class CTFAgent:
 
     async def ensure_handout_dir(self, session_id: str) -> None:
         """Ensure /workspace/handouts exists inside the container."""
+        session = self._get_session(session_id)
+        if session and session.handout_dir_ready:
+            return
         try:
             await self.docker_manager.execute_command(
                 session_id, "mkdir -p /workspace/handouts"
             )
-            self._ensured_handout_dir[session_id] = True
+            if session:
+                session.mark_handout_dir_ready()
         except Exception:
             pass
 
@@ -156,9 +160,9 @@ class CTFAgent:
         )
 
     def note_uploaded_file(self, session_id: str, filename: str) -> None:
-        files = self._session_handouts.setdefault(session_id, [])
-        if filename not in files:
-            files.append(filename)
+        session = self._get_session(session_id)
+        if session:
+            session.add_handout(filename)
 
     def _detect_challenge_type(self, url: str) -> Optional[str]:
         """Attempt to detect challenge type from URL patterns."""
@@ -297,40 +301,38 @@ class CTFAgent:
         socket_port: Optional[int] = None,
         flag_format: str = "flag{.*}",
         challenge_type: Optional[ChallengeType] = None,
+        challenge_name: Optional[str] = None,
         description: Optional[str] = None,
         uploaded_files: Optional[List[str]] = None,
         callback: Optional[Callable] = None,
         reasoning_effort: Optional[str] = None,
+        model: Optional[str] = None,
+        session_timeout: Optional[int] = None,
     ) -> List[AgentAction]:
         """Main method to solve a CTF challenge."""
         actions = []
 
         try:
-            # Initialize usage tracking
-            self._init_usage(session_id)
-            # Store session challenge type for tailored prompts
-            self._session_challenge_type[session_id] = challenge_type
-            # Set per-session reasoning effort (default low)
-            default_effort = REASONING_EFFORT_CHOICES[0]
-            try:
-                effort = str(reasoning_effort or default_effort).lower()
-                self._reasoning_effort = (
-                    effort if effort in REASONING_EFFORT_CHOICES else default_effort
-                )
-            except Exception:
-                self._reasoning_effort = default_effort
-            # Reset conversation state
-            self._session_last_response_id[session_id] = None
+            session = self._create_session(
+                session_id=session_id,
+                model_name=model,
+                reasoning_effort=reasoning_effort,
+                timeout_seconds=session_timeout,
+                challenge_type=challenge_type,
+                uploaded_files=uploaded_files,
+                challenge_name=challenge_name,
+            )
+            session.last_response_id = None
             # Create container
             await self.docker_manager.create_container(session_id)
             # Ensure handouts dir exists
             await self.ensure_handout_dir(session_id)
             # Initialize session handouts
-            self._session_handouts[session_id] = list(uploaded_files or [])
+            handouts = list(session.handouts)
             # Copy any pre-uploaded handouts into container now that it exists
-            if self._session_handouts[session_id]:
+            if handouts:
                 base_dir = os.path.join("data", "handouts", session_id)
-                for name in self._session_handouts[session_id]:
+                for name in handouts:
                     host_path = os.path.join(base_dir, name)
                     dest_path = f"/workspace/handouts/{name}"
                     try:
@@ -379,9 +381,9 @@ class CTFAgent:
             analysis_prompt = self._build_analysis_prompt(
                 url=challenge_url,
                 flag_format=flag_format,
-                challenge_type=challenge_type,
+                challenge_type=session.challenge_type,
                 description=description,
-                uploaded_files=self._session_handouts.get(session_id, []),
+                uploaded_files=session.handouts,
                 socket_host=socket_host,
                 socket_port=socket_port,
             )
@@ -413,7 +415,7 @@ class CTFAgent:
                     actions=actions,
                     flag_format=flag_format,
                     iteration=i,
-                    uploaded_files=self._session_handouts.get(session_id, []),
+                    uploaded_files=session.handouts,
                     url=challenge_url,
                     socket_host=socket_host,
                     socket_port=socket_port,
@@ -475,6 +477,10 @@ class CTFAgent:
     ) -> List[AgentAction]:
         """Execute AI-generated commands and return actions."""
         actions = []
+        session = self._get_session(session_id)
+        if not session:
+            logger.error(f"No session state found for {session_id}")
+            return actions
 
         try:
             # Use the provided prompt directly; it already contains any needed history
@@ -484,22 +490,18 @@ class CTFAgent:
             try:
                 if callback:
                     await callback("ai_status", {"thinking": True})
-                prev_id = self._session_last_response_id.get(session_id)
+                prev_id = session.last_response_id
                 _kwargs = {}
                 if prev_id:
                     _kwargs["previous_response_id"] = prev_id
                 response = await self.client.responses.parse(
-                    model=self.api_string,
+                    model=session.api_string,
                     instructions=self._get_system_prompt(session_id),
                     input=[{"role": "user", "content": input_text}],
                     max_output_tokens=2**14,
-                    reasoning={
-                        "effort": getattr(
-                            self,
-                            "_reasoning_effort",
-                            REASONING_EFFORT_CHOICES[0],
-                        )
-                    },
+                    reasoning=cast(
+                        Any, {"effort": session.reasoning_effort}
+                    ),
                     text_format=SingleCommand,
                     service_tier="flex",
                     **_kwargs,
@@ -511,9 +513,7 @@ class CTFAgent:
                 self._update_usage_from_response(session_id, response)
                 # Update last response id for conversation continuation
                 try:
-                    self._session_last_response_id[session_id] = getattr(
-                        response, "id", None
-                    )
+                    session.last_response_id = getattr(response, "id", None)
                 except Exception:
                     pass
             except Exception as e:
@@ -584,8 +584,9 @@ class CTFAgent:
                         {"id": action_id, "channel": channel, "chunk": text},
                     )
 
+            command_timeout = session.command_timeout()
             result = await self.docker_manager.execute_command_stream(
-                session_id, command, on_chunk
+                session_id, command, on_chunk, timeout=command_timeout
             )
 
             # Build final formatted output for persistence and post-processing
@@ -606,7 +607,9 @@ class CTFAgent:
             else:
                 output_parts.append("STDERR: (empty)")
 
-            if not result["success"]:
+            if result.get("timed_out"):
+                output_parts.append("FAILURE REASON: Command timed out before completion")
+            elif not result["success"]:
                 output_parts.append(
                     f"FAILURE REASON: Command exited with code {result.get('exit_code', 'unknown')}"
                 )
@@ -710,7 +713,11 @@ class CTFAgent:
         )
 
         # Challenge-specific guidance
-        ct = self._session_challenge_type.get(session_id) if session_id else None
+        ct = None
+        if session_id:
+            session = self._get_session(session_id)
+            if session:
+                ct = session.challenge_type
         specific_blocks: List[str] = []
         if ct == ChallengeType.REVERSE:
             specific_blocks.append(self._get_rev_guidance())
