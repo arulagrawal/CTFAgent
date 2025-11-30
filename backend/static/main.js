@@ -461,8 +461,11 @@ function updateSessionStatus(session) {
 
     // Update status badge
     const statusBadge = document.getElementById('status-badge');
-    statusBadge.textContent = session.status.toUpperCase();
-    statusBadge.className = `px-2 py-1 rounded-full text-xs font-medium ${getStatusClass(session.status)}`;
+    if (statusBadge && session.status) {
+        statusBadge.textContent = session.status.toUpperCase();
+        const baseClasses = 'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium';
+        statusBadge.className = `${baseClasses} ${getStatusClass(session.status)}`;
+    }
 
     // Update duration
     if (session.created_at) {
@@ -717,10 +720,12 @@ function getActionIcon(action) {
 
 function getStatusClass(status) {
     switch (status) {
-        case 'pending': return 'bg-yellow-100 text-yellow-800';
-        case 'running': return 'bg-blue-100 text-blue-800';
-        case 'completed': return 'bg-green-100 text-green-800';
-        case 'failed': return 'bg-red-100 text-red-800';
+        case 'pending': return 'bg-yellow-50 text-yellow-700';
+        case 'running': return 'bg-green-50 text-green-700';
+        case 'completed': return 'bg-blue-50 text-blue-700';
+        case 'failed':
+        case 'stopped':
+            return 'bg-red-50 text-red-700';
         default: return 'bg-gray-100 text-gray-800';
     }
 }
@@ -939,20 +944,26 @@ async function uploadHandouts() {
     }
 }
 
-function copyFlag() {
-    const flagText = document.getElementById('found-flag').textContent;
-    if (flagText) {
-        navigator.clipboard.writeText(flagText).then(() => {
-            // Show brief confirmation
-            const btn = event.target;
-            const originalText = btn.innerHTML;
-            btn.innerHTML = '<svg class="w-3 h-3 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg> Copied!';
-            setTimeout(() => { btn.innerHTML = originalText; }, 2000);
-        }).catch(err => { console.error('Failed to copy flag:', err); });
+async function copyFlag(event) {
+    const flagEl = document.getElementById('found-flag');
+    const flagText = flagEl ? String(flagEl.textContent || '').trim() : '';
+    if (!flagText) return;
+    const btn = event ? (event.currentTarget || event.target) : null;
+    const originalText = btn ? btn.innerHTML : '';
+    try {
+        const copied = await copyTextToClipboard(flagText);
+        if (!copied) {
+            throw new Error('Clipboard unavailable');
+        }
+        showButtonCopiedState(btn, originalText);
+        showTransientMessage('Flag copied to clipboard');
+    } catch (err) {
+        console.error('Failed to copy flag:', err);
+        showTransientMessage('Unable to copy flag', true);
     }
 }
 
-function copyActionFlag(event) {
+async function copyActionFlag(event) {
     try {
         const btn = event && (event.currentTarget || event.target);
         const wrapper = btn ? btn.closest('[data-action-id]') : null;
@@ -969,15 +980,69 @@ function copyActionFlag(event) {
         }
         if (!text) return;
         const originalText = btn ? btn.innerHTML : '';
-        navigator.clipboard.writeText(text).then(() => {
-            if (btn) {
-                btn.innerHTML = '<svg class="w-3 h-3 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg> Copied!';
-                setTimeout(() => { btn.innerHTML = originalText; }, 2000);
-            }
-        }).catch(() => { });
+        const copied = await copyTextToClipboard(text);
+        if (!copied) {
+            throw new Error('Clipboard unavailable');
+        }
+        showButtonCopiedState(btn, originalText);
+        showTransientMessage('Flag copied to clipboard');
     } catch (e) {
         console.error('copyActionFlag error', e);
+        showTransientMessage('Unable to copy flag', true);
     }
+}
+
+function showButtonCopiedState(btn, originalHTML) {
+    if (!btn) return;
+    btn.innerHTML = '<svg class="w-3 h-3 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg> Copied!';
+    setTimeout(() => {
+        btn.innerHTML = originalHTML;
+    }, 2000);
+}
+
+async function copyTextToClipboard(text) {
+    if (!text) return false;
+    try {
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+        return fallbackCopyText(text);
+    } catch (err) {
+        console.error('Clipboard write failed', err);
+        return false;
+    }
+}
+
+function fallbackCopyText(text) {
+    try {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'absolute';
+        textarea.style.left = '-9999px';
+        document.body.appendChild(textarea);
+        textarea.select();
+        const success = document.execCommand('copy');
+        document.body.removeChild(textarea);
+        return success;
+    } catch (err) {
+        console.error('Fallback copy failed', err);
+        return false;
+    }
+}
+
+function showTransientMessage(message, isError = false) {
+    if (!message) return;
+    const container = document.createElement('div');
+    container.textContent = message;
+    container.className = `fixed bottom-4 right-4 text-white text-sm px-4 py-2 rounded shadow-lg opacity-0 transition ${isError ? 'bg-red-600' : 'bg-gray-900'}`;
+    document.body.appendChild(container);
+    requestAnimationFrame(() => container.classList.remove('opacity-0'));
+    setTimeout(() => {
+        container.classList.add('opacity-0');
+        container.addEventListener('transitionend', () => container.remove(), { once: true });
+    }, 2000);
 }
 
 // Layout adjustment functions

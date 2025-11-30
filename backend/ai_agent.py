@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 # Substrings that invalidate a matched flag candidate (case-insensitive)
 FLAG_CANDIDATE_BANNED_SUBSTRINGS = ("fake", "redacted", "test")
+REASONING_EFFORT_CHOICES = ("low", "medium", "high")
 
 
 class SingleCommand(BaseModel):
@@ -310,14 +311,14 @@ class CTFAgent:
             # Store session challenge type for tailored prompts
             self._session_challenge_type[session_id] = challenge_type
             # Set per-session reasoning effort (default low)
+            default_effort = REASONING_EFFORT_CHOICES[0]
             try:
+                effort = str(reasoning_effort or default_effort).lower()
                 self._reasoning_effort = (
-                    str(reasoning_effort).lower()
-                    if reasoning_effort in ("low", "medium")
-                    else "low"
+                    effort if effort in REASONING_EFFORT_CHOICES else default_effort
                 )
             except Exception:
-                self._reasoning_effort = "low"
+                self._reasoning_effort = default_effort
             # Reset conversation state
             self._session_last_response_id[session_id] = None
             # Create container
@@ -492,7 +493,13 @@ class CTFAgent:
                     instructions=self._get_system_prompt(session_id),
                     input=[{"role": "user", "content": input_text}],
                     max_output_tokens=2**14,
-                    reasoning={"effort": getattr(self, "_reasoning_effort", "low")},
+                    reasoning={
+                        "effort": getattr(
+                            self,
+                            "_reasoning_effort",
+                            REASONING_EFFORT_CHOICES[0],
+                        )
+                    },
                     text_format=SingleCommand,
                     service_tier="flex",
                     **_kwargs,

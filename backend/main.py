@@ -35,7 +35,7 @@ from .models import (
     AgentAction,
     WebSocketMessage,
 )
-from .ai_agent import CTFAgent
+from .ai_agent import CTFAgent, REASONING_EFFORT_CHOICES
 from .docker_manager import DockerManager
 from .llm_models import is_valid_model, get_api_string, get_available_models
 
@@ -264,6 +264,11 @@ async def start_challenge(
             detail=f"Invalid model '{model}'. Available models: {available_models}"
         )
 
+    # Normalize reasoning effort selection
+    reasoning_effort_value = (reasoning_effort or "").strip().lower()
+    if reasoning_effort_value not in REASONING_EFFORT_CHOICES:
+        reasoning_effort_value = REASONING_EFFORT_CHOICES[0]
+
     # Create session
     session = ChallengeSession(
         session_id=session_id,
@@ -308,7 +313,7 @@ async def start_challenge(
             description,
             timeout,
             model,
-            reasoning_effort,
+            reasoning_effort_value,
         )
     )
     background_tasks[session_id] = task
