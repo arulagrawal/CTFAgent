@@ -107,4 +107,3 @@ class Session:
 
     def mark_handout_dir_ready(self) -> None:
         self.handout_dir_ready = True
-

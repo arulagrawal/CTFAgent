@@ -76,6 +76,7 @@ def get_current_flag_format() -> str:
 class FlagFormatUpdate(BaseModel):
     flag_format: str
 
+
 # Load environment variables
 load_dotenv()
 
@@ -106,7 +107,9 @@ templates = Jinja2Templates(directory="backend/templates")
 app.mount("/static", StaticFiles(directory="backend/static"), name="static")
 
 
-STATIC_VERSION = os.getenv("STATIC_VERSION") or str(int(datetime.now(timezone.utc).timestamp()))
+STATIC_VERSION = os.getenv("STATIC_VERSION") or str(
+    int(datetime.now(timezone.utc).timestamp())
+)
 templates.env.globals["STATIC_VERSION"] = STATIC_VERSION
 
 # Global state
@@ -123,12 +126,12 @@ try:
 
     model_from_env = os.getenv("OPENAI_MODEL", "gpt-5-mini")
     if not is_valid_model(model_from_env):
-        logger.warning(f"Invalid model '{model_from_env}' from OPENAI_MODEL env var, using 'gpt-5-mini'")
+        logger.warning(
+            f"Invalid model '{model_from_env}' from OPENAI_MODEL env var, using 'gpt-5-mini'"
+        )
         model_from_env = "gpt-5-mini"
 
-    ai_agent = CTFAgent(
-        openai_api_key=openai_api_key, model=model_from_env
-    )
+    ai_agent = CTFAgent(openai_api_key=openai_api_key, model=model_from_env)
 except Exception as e:
     logger.error(f"Failed to initialize AI agent: {e}")
     ai_agent = None
@@ -259,10 +262,10 @@ async def start_challenge(
 
     # Validate model name
     if not is_valid_model(model):
-        available_models = ', '.join(get_available_models().keys())
+        available_models = ", ".join(get_available_models().keys())
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid model '{model}'. Available models: {available_models}"
+            detail=f"Invalid model '{model}'. Available models: {available_models}",
         )
 
     # Normalize reasoning effort selection
@@ -318,7 +321,7 @@ async def start_challenge(
             challenge_type,
             challenge_name,
             description,
-        timeout_value,
+            timeout_value,
             model,
             reasoning_effort_value,
         )
@@ -420,7 +423,9 @@ async def stop_challenge(session_id: str):
                 session_id=session_id,
                 data={"status": session.status, "error": session.error_message},
             )
-            asyncio.create_task(websocket_manager.send_message(session_id, cancel_message))
+            asyncio.create_task(
+                websocket_manager.send_message(session_id, cancel_message)
+            )
         except Exception as e:
             logger.debug(f"WebSocket notify on stop failed for {session_id}: {e}")
 
@@ -672,7 +677,9 @@ async def solve_challenge_background_form(
                         )
                     )
                     if usage_action.output:
-                        m = re.search(r"Estimated cost: \$(\d+\.\d+)", usage_action.output)
+                        m = re.search(
+                            r"Estimated cost: \$(\d+\.\d+)", usage_action.output
+                        )
                         if m:
                             session.estimated_cost_usd = float(m.group(1))
         except Exception:
@@ -723,7 +730,9 @@ async def solve_challenge_background_form(
                 session_id=session_id,
                 data={"status": session.status, "error": session.error_message},
             )
-            asyncio.create_task(websocket_manager.send_message(session_id, cancel_message))
+            asyncio.create_task(
+                websocket_manager.send_message(session_id, cancel_message)
+            )
         except Exception:
             pass
         raise

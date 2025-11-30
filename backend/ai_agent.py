@@ -10,7 +10,12 @@ from openai import AsyncOpenAI
 
 from .models import AgentAction, ChallengeType
 from .docker_manager import DockerManager
-from .llm_models import get_model_info, get_api_string, is_valid_model, get_available_models
+from .llm_models import (
+    get_model_info,
+    get_api_string,
+    is_valid_model,
+    get_available_models,
+)
 from .session import Session
 from pydantic import BaseModel
 
@@ -31,8 +36,10 @@ class CTFAgent:
     def __init__(self, openai_api_key: str, model: str = "gpt-5-mini"):
         # Validate and normalize model name
         if not is_valid_model(model):
-            available_models = ', '.join(get_available_models().keys())
-            logger.warning(f"Unknown model '{model}', using as-is. Available models: {available_models}")
+            available_models = ", ".join(get_available_models().keys())
+            logger.warning(
+                f"Unknown model '{model}', using as-is. Available models: {available_models}"
+            )
         self.client = AsyncOpenAI(api_key=openai_api_key)
         # Store the original model name for display, but use API string for API calls
         self.default_model = model
@@ -93,10 +100,12 @@ class CTFAgent:
         try:
             model_name = str(stats.get("model", session.model))
             model_info = get_model_info(model_name)
-            
+
             if not model_info:
                 # Fallback to default pricing if model not found
-                logger.warning(f"Model '{model_name}' not found in registry, using default pricing")
+                logger.warning(
+                    f"Model '{model_name}' not found in registry, using default pricing"
+                )
                 price_in = 1.250  # USD per 1M input tokens
                 price_out = 10.000  # USD per 1M output tokens
             else:
@@ -499,9 +508,7 @@ class CTFAgent:
                     instructions=self._get_system_prompt(session_id),
                     input=[{"role": "user", "content": input_text}],
                     max_output_tokens=2**14,
-                    reasoning=cast(
-                        Any, {"effort": session.reasoning_effort}
-                    ),
+                    reasoning=cast(Any, {"effort": session.reasoning_effort}),
                     text_format=SingleCommand,
                     service_tier="flex",
                     **_kwargs,
@@ -608,7 +615,9 @@ class CTFAgent:
                 output_parts.append("STDERR: (empty)")
 
             if result.get("timed_out"):
-                output_parts.append("FAILURE REASON: Command timed out before completion")
+                output_parts.append(
+                    "FAILURE REASON: Command timed out before completion"
+                )
             elif not result["success"]:
                 output_parts.append(
                     f"FAILURE REASON: Command exited with code {result.get('exit_code', 'unknown')}"

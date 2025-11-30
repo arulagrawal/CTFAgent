@@ -14,6 +14,7 @@ from typing import Dict, Optional
 @dataclass
 class LLMModelInfo:
     """Information about an LLM model."""
+
     name: str  # Display name
     api_string: str  # API identifier string
     price_input_per_1m: float  # Price per 1M input tokens in USD
@@ -46,10 +47,10 @@ MODEL_REGISTRY: Dict[str, LLMModelInfo] = {
 def get_model_info(model_name: str) -> Optional[LLMModelInfo]:
     """
     Get model information by model name.
-    
+
     Args:
         model_name: The model name (e.g., "gpt-5-mini", "gpt-5", "gpt-5.1")
-        
+
     Returns:
         LLMModelInfo if found, None otherwise
     """
@@ -61,10 +62,10 @@ def get_model_info(model_name: str) -> Optional[LLMModelInfo]:
 def get_api_string(model_name: str) -> str:
     """
     Get the API string for a model name.
-    
+
     Args:
         model_name: The model name
-        
+
     Returns:
         The API string, or the original model_name if not found
     """
@@ -78,7 +79,7 @@ def get_api_string(model_name: str) -> str:
 def get_available_models() -> Dict[str, LLMModelInfo]:
     """
     Get all available models.
-    
+
     Returns:
         Dictionary mapping model names to their info
     """
@@ -88,12 +89,11 @@ def get_available_models() -> Dict[str, LLMModelInfo]:
 def is_valid_model(model_name: str) -> bool:
     """
     Check if a model name is valid.
-    
+
     Args:
         model_name: The model name to check
-        
+
     Returns:
         True if valid, False otherwise
     """
     return get_model_info(model_name) is not None
-
