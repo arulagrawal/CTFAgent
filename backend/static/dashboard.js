@@ -118,12 +118,18 @@ function renderFlagCell(session) {
 function renderActions(session) {
     const safeSessionId = escapeHtml(session.session_id);
     const viewBtn = `<button class="view-session inline-flex items-center px-3 py-1.5 border border-gray-300 rounded-md text-xs font-medium text-gray-700 hover:bg-gray-50" data-session="${safeSessionId}">View</button>`;
-    const stopBtn = `<button class="stop-session inline-flex items-center px-3 py-1.5 border border-red-300 rounded-md text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-40" data-session="${safeSessionId}" ${session.status === 'running' ? '' : 'disabled'}>Stop</button>`;
+
+    let actionBtn;
+    if (session.status === 'running' || session.status === 'pending') {
+        actionBtn = `<button class="stop-session inline-flex items-center px-3 py-1.5 border border-red-300 rounded-md text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-40" data-session="${safeSessionId}">Stop</button>`;
+    } else {
+        actionBtn = `<button class="delete-session inline-flex items-center px-3 py-1.5 border border-gray-300 rounded-md text-xs font-medium text-gray-700 hover:bg-red-50 hover:text-red-700 hover:border-red-300 transition" data-session="${safeSessionId}">Delete</button>`;
+    }
 
     return `
         <div class="flex flex-wrap gap-2">
             ${viewBtn}
-            ${stopBtn}
+            ${actionBtn}
         </div>
     `;
 }
@@ -180,6 +186,28 @@ function wireActionButtons() {
             } catch (err) {
                 console.error('Stop failed', err);
                 alert(err.message || 'Failed to stop session');
+            } finally {
+                fetchSessions();
+            }
+        });
+    });
+
+    document.querySelectorAll('.delete-session').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+            const sessionId = btn.dataset.session;
+            if (!sessionId || btn.disabled) return;
+            const confirmed = window.confirm('Are you sure you want to delete this session history?');
+            if (!confirmed) return;
+            btn.disabled = true;
+            try {
+                const res = await fetch(`/challenges/${sessionId}`, { method: 'DELETE' });
+                if (!res.ok) {
+                    throw new Error('Failed to delete session');
+                }
+                showTransientMessage('Session deleted');
+            } catch (err) {
+                console.error('Delete failed', err);
+                alert(err.message || 'Failed to delete session');
             } finally {
                 fetchSessions();
             }
