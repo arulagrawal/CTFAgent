@@ -16,7 +16,6 @@ let refreshTimer = null;
 })();
 
 async function fetchSessions(isManual = false) {
-    console.log('fetchSessions', isManual);
     const errorEl = document.getElementById('dashboard-error');
     if (errorEl) errorEl.classList.add('hidden');
 
