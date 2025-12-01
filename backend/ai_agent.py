@@ -33,7 +33,7 @@ class SingleCommand(BaseModel):
 
 
 class CTFAgent:
-    def __init__(self, openai_api_key: str, model: str = "gpt-5-mini"):
+    def __init__(self, openai_api_key: str, model: str = "gpt-5.1"):
         # Validate and normalize model name
         if not is_valid_model(model):
             available_models = ", ".join(get_available_models().keys())
@@ -72,7 +72,7 @@ class CTFAgent:
             challenge_name=challenge_name.strip() if challenge_name else None,
         )
         session.set_reasoning_effort(
-            reasoning_effort, REASONING_EFFORT_CHOICES, REASONING_EFFORT_CHOICES[0]
+            reasoning_effort, REASONING_EFFORT_CHOICES, REASONING_EFFORT_CHOICES[1]
         )
         session.set_deadline(timeout_seconds)
         session.set_handouts(uploaded_files or [])
