@@ -22,7 +22,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse
+from fastapi.encoders import jsonable_encoder
+from pathlib import Path
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
 from .models import (
     ChallengeRequest,
@@ -32,9 +35,47 @@ from .models import (
     AgentAction,
     WebSocketMessage,
 )
-from .ai_agent import CTFAgent
+from .ai_agent import CTFAgent, REASONING_EFFORT_CHOICES
 from .docker_manager import DockerManager
 from .llm_models import is_valid_model, get_api_string, get_available_models
+
+DEFAULT_FLAG_FORMAT = "SCF2024-[A-Za-z0-9-_]{10,}"
+FLAG_FORMAT_PATH = Path("data/settings/flag_format.txt")
+flag_format_lock = asyncio.Lock()
+
+
+def _ensure_flag_format_path():
+    FLAG_FORMAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _load_flag_format_from_disk() -> str:
+    try:
+        if FLAG_FORMAT_PATH.exists():
+            value = FLAG_FORMAT_PATH.read_text(encoding="utf-8").strip()
+            return value or DEFAULT_FLAG_FORMAT
+    except Exception as e:
+        logger.warning(f"Failed to load flag format from disk: {e}")
+    return DEFAULT_FLAG_FORMAT
+
+
+def _save_flag_format_to_disk(value: str):
+    try:
+        _ensure_flag_format_path()
+        FLAG_FORMAT_PATH.write_text(value, encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to persist flag format: {e}")
+
+
+current_flag_format = _load_flag_format_from_disk()
+
+
+def get_current_flag_format() -> str:
+    return current_flag_format or DEFAULT_FLAG_FORMAT
+
+
+class FlagFormatUpdate(BaseModel):
+    flag_format: str
+
 
 # Load environment variables
 load_dotenv()
@@ -65,6 +106,12 @@ app.add_middleware(
 templates = Jinja2Templates(directory="backend/templates")
 app.mount("/static", StaticFiles(directory="backend/static"), name="static")
 
+
+STATIC_VERSION = os.getenv("STATIC_VERSION") or str(
+    int(datetime.now(timezone.utc).timestamp())
+)
+templates.env.globals["STATIC_VERSION"] = STATIC_VERSION
+
 # Global state
 sessions: Dict[str, ChallengeSession] = {}
 websocket_connections: Dict[str, WebSocket] = {}
@@ -79,12 +126,12 @@ try:
 
     model_from_env = os.getenv("OPENAI_MODEL", "gpt-5-mini")
     if not is_valid_model(model_from_env):
-        logger.warning(f"Invalid model '{model_from_env}' from OPENAI_MODEL env var, using 'gpt-5-mini'")
+        logger.warning(
+            f"Invalid model '{model_from_env}' from OPENAI_MODEL env var, using 'gpt-5-mini'"
+        )
         model_from_env = "gpt-5-mini"
 
-    ai_agent = CTFAgent(
-        openai_api_key=openai_api_key, model=model_from_env
-    )
+    ai_agent = CTFAgent(openai_api_key=openai_api_key, model=model_from_env)
 except Exception as e:
     logger.error(f"Failed to initialize AI agent: {e}")
     ai_agent = None
@@ -119,7 +166,19 @@ websocket_manager = WebSocketManager()
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(
+        "index.html",
+        {"request": request, "default_flag_format": get_current_flag_format()},
+    )
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    """Render the multi-session dashboard."""
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {"request": request, "default_flag_format": get_current_flag_format()},
+    )
 
 
 @app.get("/health")
@@ -131,15 +190,50 @@ async def health_check():
     }
 
 
+@app.get("/challenges")
+async def list_challenges(status: ChallengeStatus | None = None):
+    """Return all challenge sessions, optionally filtered by status."""
+    items = list(sessions.values())
+    if status:
+        items = [session for session in items if session.status == status]
+
+    # Sort by newest first for easier scanning on the dashboard
+    items.sort(key=lambda s: s.updated_at, reverse=True)
+    return {"sessions": jsonable_encoder(items)}
+
+
+@app.get("/settings/flag-format")
+async def get_flag_format_setting():
+    return {"flag_format": get_current_flag_format()}
+
+
+@app.post("/settings/flag-format")
+async def update_flag_format_setting(payload: FlagFormatUpdate):
+    global current_flag_format
+    value = (payload.flag_format or "").strip() or DEFAULT_FLAG_FORMAT
+    try:
+        re.compile(value)
+    except re.error as e:
+        raise HTTPException(status_code=400, detail=f"Invalid flag regex: {e}")
+
+    async with flag_format_lock:
+        current_flag_format = value
+        _save_flag_format_to_disk(value)
+
+    logger.info(f"Updated default flag format to: {value}")
+    return {"flag_format": current_flag_format}
+
+
 @app.post("/challenges/start")
 async def start_challenge(
     url: str | None = Form(None),
     host: str | None = Form(None),
     port: int | None = Form(None),
-    flag_format: str = Form("flag{.*}"),
+    flag_format: str | None = Form(None),
     challenge_type: str | None = Form(None),
+    challenge_name: str | None = Form(None),
     description: str | None = Form(None),
-    timeout: int = Form(300),
+    timeout: int = Form(600),
     model: str = Form("gpt-5-mini"),
     reasoning_effort: str = Form("low"),
     handouts: List[UploadFile] | None = None,
@@ -158,6 +252,9 @@ async def start_challenge(
         )
 
     # Validate flag regex early
+    if not flag_format:
+        flag_format = get_current_flag_format()
+
     try:
         re.compile(flag_format)
     except re.error as e:
@@ -165,11 +262,20 @@ async def start_challenge(
 
     # Validate model name
     if not is_valid_model(model):
-        available_models = ', '.join(get_available_models().keys())
+        available_models = ", ".join(get_available_models().keys())
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid model '{model}'. Available models: {available_models}"
+            detail=f"Invalid model '{model}'. Available models: {available_models}",
         )
+
+    # Normalize reasoning effort selection
+    reasoning_effort_value = (reasoning_effort or "").strip().lower()
+    if reasoning_effort_value not in REASONING_EFFORT_CHOICES:
+        reasoning_effort_value = REASONING_EFFORT_CHOICES[0]
+
+    # Normalize timeout with sane bounds
+    timeout_value = timeout or 600
+    timeout_value = max(60, min(int(timeout_value), 1800))
 
     # Create session
     session = ChallengeSession(
@@ -177,6 +283,7 @@ async def start_challenge(
         challenge_url=str(url) if url else None,
         host=host,
         port=port,
+        challenge_name=challenge_name.strip() if challenge_name else None,
         flag_format=flag_format,
         found_flag=None,
         status=ChallengeStatus.PENDING,
@@ -212,10 +319,11 @@ async def start_challenge(
             port,
             flag_format,
             challenge_type,
+            challenge_name,
             description,
-            timeout,
+            timeout_value,
             model,
-            reasoning_effort,
+            reasoning_effort_value,
         )
     )
     background_tasks[session_id] = task
@@ -274,7 +382,7 @@ async def get_challenge_status(session_id: str):
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    return sessions[session_id]
+    return jsonable_encoder(sessions[session_id])
 
 
 @app.get("/challenges/{session_id}/actions")
@@ -283,7 +391,7 @@ async def get_challenge_actions(session_id: str):
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    return {"actions": sessions[session_id].actions}
+    return {"actions": jsonable_encoder(sessions[session_id].actions)}
 
 
 @app.post("/challenges/{session_id}/stop")
@@ -315,7 +423,9 @@ async def stop_challenge(session_id: str):
                 session_id=session_id,
                 data={"status": session.status, "error": session.error_message},
             )
-            asyncio.create_task(websocket_manager.send_message(session_id, cancel_message))
+            asyncio.create_task(
+                websocket_manager.send_message(session_id, cancel_message)
+            )
         except Exception as e:
             logger.debug(f"WebSocket notify on stop failed for {session_id}: {e}")
 
@@ -387,12 +497,15 @@ async def solve_challenge_background_form(
     port: int | None,
     flag_format: str,
     challenge_type: str | None,
+    challenge_name: str | None,
     description: str | None,
     timeout: int,
     model: str,
     reasoning_effort: str,
 ):
     """Background task to solve challenge."""
+    timeout = timeout or 600
+    timeout = max(1, timeout)
     session = sessions[session_id]
     session.status = ChallengeStatus.RUNNING
     session.updated_at = datetime.now(timezone.utc)
@@ -457,13 +570,6 @@ async def solve_challenge_background_form(
                 except Exception as e:
                     logger.warning(f"Error copying handout {name} before start: {e}")
 
-        # Update model per-session if frontend selected a specific model
-        try:
-            if model:
-                ai_agent.model = model
-                ai_agent.api_string = get_api_string(model)
-        except Exception:
-            pass
         # Normalize challenge type string to enum when possible
         ct_enum = None
         try:
@@ -473,17 +579,23 @@ async def solve_challenge_background_form(
         except Exception:
             ct_enum = None
 
-        actions = await ai_agent.solve_challenge(
-            session_id=session_id,
-            challenge_url=str(url) if url else None,
-            socket_host=host,
-            socket_port=port,
-            flag_format=flag_format,
-            challenge_type=ct_enum,  # type: ignore[arg-type]
-            description=description,
-            uploaded_files=session.uploaded_files,
-            callback=websocket_callback,
-            reasoning_effort=reasoning_effort,
+        actions = await asyncio.wait_for(
+            ai_agent.solve_challenge(
+                session_id=session_id,
+                challenge_url=str(url) if url else None,
+                socket_host=host,
+                socket_port=port,
+                flag_format=flag_format,
+                challenge_type=ct_enum,  # type: ignore[arg-type]
+                challenge_name=challenge_name,
+                description=description,
+                uploaded_files=session.uploaded_files,
+                callback=websocket_callback,
+                reasoning_effort=reasoning_effort,
+                model=model,
+                session_timeout=timeout,
+            ),
+            timeout=timeout,
         )
 
         # Update session with results
@@ -513,6 +625,65 @@ async def solve_challenge_background_form(
         else:
             session.status = ChallengeStatus.FAILED
             session.error_message = "Flag not found within time limit"
+
+    except asyncio.TimeoutError:
+        logger.error(f"Challenge solving timed out for session {session_id}")
+        session.status = ChallengeStatus.FAILED
+        session.error_message = f"Timed out after {timeout} seconds"
+        session.updated_at = datetime.now(timezone.utc)
+
+        timeout_action = AgentAction(
+            timestamp=datetime.now(timezone.utc),
+            action_type="session_timeout",
+            output=f"Session timed out after {timeout} seconds.",
+            reasoning="Global session timeout reached",
+            success=False,
+        )
+        session.actions.append(timeout_action)
+        asyncio.create_task(
+            websocket_manager.send_message(
+                session_id,
+                WebSocketMessage(
+                    type="action",
+                    session_id=session_id,
+                    data=timeout_action.dict(),
+                ),
+            )
+        )
+        asyncio.create_task(
+            websocket_manager.send_message(
+                session_id,
+                WebSocketMessage(
+                    type="status",
+                    session_id=session_id,
+                    data={"status": session.status, "error": session.error_message},
+                ),
+            )
+        )
+
+        try:
+            if ai_agent:
+                usage_action = ai_agent.build_usage_summary_action(session_id)
+                if usage_action:
+                    session.actions.append(usage_action)
+                    asyncio.create_task(
+                        websocket_manager.send_message(
+                            session_id,
+                            WebSocketMessage(
+                                type="action",
+                                session_id=session_id,
+                                data=usage_action.dict(),
+                            ),
+                        )
+                    )
+                    if usage_action.output:
+                        m = re.search(
+                            r"Estimated cost: \$(\d+\.\d+)", usage_action.output
+                        )
+                        if m:
+                            session.estimated_cost_usd = float(m.group(1))
+        except Exception:
+            pass
 
     except asyncio.CancelledError:
         logger.info(f"Background solving cancelled for session {session_id}")
@@ -559,7 +730,9 @@ async def solve_challenge_background_form(
                 session_id=session_id,
                 data={"status": session.status, "error": session.error_message},
             )
-            asyncio.create_task(websocket_manager.send_message(session_id, cancel_message))
+            asyncio.create_task(
+                websocket_manager.send_message(session_id, cancel_message)
+            )
         except Exception:
             pass
         raise
@@ -592,6 +765,11 @@ async def solve_challenge_background_form(
                 await ai_agent.docker_manager.cleanup_container(session_id)
         except Exception as e:
             logger.error(f"Failed to cleanup container for session {session_id}: {e}")
+        try:
+            if ai_agent:
+                ai_agent.clear_session_state(session_id)
+        except Exception as e:
+            logger.error(f"Failed to clear session state for {session_id}: {e}")
         # Remove task from registry if present
         background_tasks.pop(session_id, None)
 

@@ -75,6 +75,7 @@ An AI-powered agent for solving Capture The Flag (CTF) challenges automatically.
    - Enter the challenge URL
    - Specify the flag format (regex pattern, e.g., `flag{.*}`)
    - Optionally set challenge type and description
+   - Choose the reasoning effort (Low, Medium, High) for model planning depth
    - Click "Start Challenge"
 
 2. **Monitor Progress**:

@@ -1,26 +1,110 @@
+const templateFlagFormat = readTemplateFlagFormat();
 let currentSession = null;
 let websocket = null;
 let startTime = null;
+let pollIntervalId = null;
+let pollTimeoutId = null;
+let lastAppliedFlagDefault = null;
+let flagFormatTouched = false;
+let flagPreferenceInitialized = false;
+let serverFlagFormat = templateFlagFormat;
+
+function readTemplateFlagFormat() {
+    if (typeof document !== 'undefined') {
+        const input = document.getElementById('flag_format');
+        if (input && input.dataset && input.dataset.defaultFlag) {
+            return input.dataset.defaultFlag;
+        }
+    }
+    return 'flag{.+}';
+}
 
 // Initialize the application
 document.addEventListener('DOMContentLoaded', function () {
     checkApiHealth();
     setupEventListeners();
+    initFlagFormatPreference();
+    hydrateFromQueryParams();
 });
 
 function setupEventListeners() {
-    document.getElementById('challenge-form').addEventListener('submit', handleFormSubmit);
-    document.getElementById('stop-btn').addEventListener('click', stopChallenge);
-    document.getElementById('delete-btn').addEventListener('click', deleteSession);
-    document.getElementById('handout-upload-btn').addEventListener('click', uploadHandouts);
-    document.getElementById('target_type').addEventListener('change', onTargetTypeChange);
-    document.getElementById('toggle-form-btn').addEventListener('click', toggleChallengeForm);
+    const form = document.getElementById('challenge-form');
+    if (!form) {
+        return;
+    }
+
+    form.addEventListener('submit', handleFormSubmit);
+
+    const stopBtn = document.getElementById('stop-btn');
+    if (stopBtn) stopBtn.addEventListener('click', stopChallenge);
+
+    const deleteBtn = document.getElementById('delete-btn');
+    if (deleteBtn) deleteBtn.addEventListener('click', deleteSession);
+
+    const uploadBtn = document.getElementById('handout-upload-btn');
+    if (uploadBtn) uploadBtn.addEventListener('click', uploadHandouts);
+
+    const targetSelect = document.getElementById('target_type');
+    if (targetSelect) targetSelect.addEventListener('change', onTargetTypeChange);
+
+    const toggleBtn = document.getElementById('toggle-form-btn');
+    if (toggleBtn) toggleBtn.addEventListener('click', toggleChallengeForm);
+
     const hostEl = document.getElementById('host');
     if (hostEl) {
         hostEl.addEventListener('paste', onHostPaste);
         hostEl.addEventListener('change', onHostChange);
     }
+
+    const flagInput = document.getElementById('flag_format');
+    if (flagInput) {
+        flagInput.addEventListener('input', () => {
+            flagFormatTouched = flagInput.value !== lastAppliedFlagDefault;
+        });
+    }
+
     onTargetTypeChange();
+}
+
+function hydrateFromQueryParams() {
+    const params = new URLSearchParams(window.location.search);
+    const sessionId = params.get('session');
+    if (sessionId) {
+        loadExistingSession(sessionId.trim());
+    } else {
+        clearPersistedSessionId();
+    }
+}
+
+async function loadExistingSession(sessionId) {
+    if (!sessionId) return;
+    try {
+        setLoading(true);
+        hideError();
+        showSessionLoadingState(sessionId);
+        const response = await fetch(`/challenges/${sessionId}`);
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}));
+            throw new Error(error.detail || 'Session not found');
+        }
+        const session = await response.json();
+        currentSession = session;
+
+        adjustLayoutForActiveSession();
+        updateSessionStatus(session);
+        persistSessionId(sessionId);
+        updateUrlWithSession(sessionId);
+        await fetchActions(sessionId);
+        setupWebSocket(sessionId);
+        startPolling(sessionId).catch((err) => {
+            console.error('Polling error', err);
+        });
+    } catch (error) {
+        console.error('Failed to hydrate session', error);
+        showError(error.message || 'Failed to load session');
+    } finally {
+        setLoading(false);
+    }
 }
 
 async function checkApiHealth() {
@@ -82,7 +166,9 @@ function onHostChange(event) {
 }
 
 function onTargetTypeChange() {
-    const type = document.getElementById('target_type').value;
+    const targetSelect = document.getElementById('target_type');
+    if (!targetSelect) return;
+    const type = targetSelect.value;
     const urlBlock = document.getElementById('url-input-block');
     const socketBlock = document.getElementById('socket-input-block');
     const urlInput = document.getElementById('url');
@@ -123,6 +209,7 @@ async function handleFormSubmit(event) {
     const flagFormat = document.getElementById('flag_format').value;
     const challengeType = document.getElementById('challenge_type').value;
     const description = document.getElementById('description').value;
+    const challengeName = document.getElementById('challenge_name')?.value || '';
     const timeout = document.getElementById('timeout').value;
     const model = document.getElementById('model').value;
     const reasoningEffort = document.getElementById('reasoning_effort').value;
@@ -148,6 +235,7 @@ async function handleFormSubmit(event) {
     formData.append('flag_format', flagFormat);
     if (challengeType) formData.append('challenge_type', challengeType);
     if (description) formData.append('description', description);
+    if (challengeName) formData.append('challenge_name', challengeName);
     formData.append('timeout', timeout);
     formData.append('model', model);
     formData.append('reasoning_effort', reasoningEffort);
@@ -173,6 +261,8 @@ async function handleFormSubmit(event) {
 
         const data = await response.json();
         currentSession = { session_id: data.session_id };
+        persistSessionId(data.session_id);
+        updateUrlWithSession(data.session_id);
 
         // Clear previous flag display
         document.getElementById('flag-found').classList.add('hidden');
@@ -214,7 +304,15 @@ async function handleFormSubmit(event) {
 }
 
 function setupWebSocket(sessionId) {
-    const wsUrl = `ws://${window.location.host}/ws/${sessionId}`;
+    if (websocket) {
+        try {
+            websocket.close();
+        } catch (err) {
+            console.warn('Failed to close previous WebSocket', err);
+        }
+    }
+    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsUrl = `${protocol}://${window.location.host}/ws/${sessionId}`;
     websocket = new WebSocket(wsUrl);
 
     websocket.onopen = function () {
@@ -266,6 +364,10 @@ function handleWebSocketMessage(message) {
         case 'status':
             if (currentSession) {
                 updateSessionStatus({ ...currentSession, ...message.data });
+                if (message.data.session_id) {
+                    persistSessionId(message.data.session_id);
+                    updateUrlWithSession(message.data.session_id);
+                }
             }
             break;
         case 'ai_status':
@@ -274,19 +376,29 @@ function handleWebSocketMessage(message) {
     }
 }
 
+function stopPolling() {
+    if (pollIntervalId) {
+        clearInterval(pollIntervalId);
+        pollIntervalId = null;
+    }
+    if (pollTimeoutId) {
+        clearTimeout(pollTimeoutId);
+        pollTimeoutId = null;
+    }
+}
+
 async function startPolling(sessionId) {
-    // Initial fetch
+    stopPolling();
     await fetchSessionStatus(sessionId);
     await fetchActions(sessionId);
 
-    // Poll every 2 seconds for 30 seconds
-    const pollInterval = setInterval(async () => {
+    pollIntervalId = setInterval(async () => {
         await fetchSessionStatus(sessionId);
         await fetchActions(sessionId);
     }, 2000);
 
-    setTimeout(() => {
-        clearInterval(pollInterval);
+    pollTimeoutId = setTimeout(() => {
+        stopPolling();
     }, 30000);
 }
 
@@ -318,6 +430,15 @@ function updateSessionStatus(session) {
     currentSession = session;
 
     document.getElementById('session-id').textContent = session.session_id;
+    const nameRow = document.getElementById('challenge-name-row');
+    const nameValue = document.getElementById('challenge-name-value');
+    if (session.challenge_name) {
+        if (nameRow) nameRow.classList.remove('hidden');
+        if (nameValue) nameValue.textContent = session.challenge_name;
+    } else {
+        if (nameRow) nameRow.classList.add('hidden');
+        if (nameValue) nameValue.textContent = '';
+    }
     const urlBlock = document.getElementById('url-status-block');
     const socketBlock = document.getElementById('socket-status-block');
     const urlEl = document.getElementById('challenge-url');
@@ -351,8 +472,11 @@ function updateSessionStatus(session) {
 
     // Update status badge
     const statusBadge = document.getElementById('status-badge');
-    statusBadge.textContent = session.status.toUpperCase();
-    statusBadge.className = `px-2 py-1 rounded-full text-xs font-medium ${getStatusClass(session.status)}`;
+    if (statusBadge && session.status) {
+        statusBadge.textContent = session.status.toUpperCase();
+        const baseClasses = 'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium';
+        statusBadge.className = `${baseClasses} ${getStatusClass(session.status)}`;
+    }
 
     // Update duration
     if (session.created_at) {
@@ -607,10 +731,12 @@ function getActionIcon(action) {
 
 function getStatusClass(status) {
     switch (status) {
-        case 'pending': return 'bg-yellow-100 text-yellow-800';
-        case 'running': return 'bg-blue-100 text-blue-800';
-        case 'completed': return 'bg-green-100 text-green-800';
-        case 'failed': return 'bg-red-100 text-red-800';
+        case 'pending': return 'bg-yellow-50 text-yellow-700';
+        case 'running': return 'bg-green-50 text-green-700';
+        case 'completed': return 'bg-blue-50 text-blue-700';
+        case 'failed':
+        case 'stopped':
+            return 'bg-red-50 text-red-700';
         default: return 'bg-gray-100 text-gray-800';
     }
 }
@@ -670,6 +796,7 @@ async function deleteSession() {
                 live.classList.add('invisible');
                 live.classList.remove('hidden');
             }
+            stopPolling();
             resetLayoutAfterSession();
             if (websocket) {
                 websocket.close();
@@ -686,6 +813,9 @@ async function deleteSession() {
 function setLoading(loading) {
     const startBtn = document.getElementById('start-btn');
     const startText = document.getElementById('start-text');
+    if (!startBtn || !startText) {
+        return;
+    }
 
     if (loading) {
         startBtn.disabled = true;
@@ -695,6 +825,90 @@ function setLoading(loading) {
         startBtn.disabled = false;
         startBtn.classList.remove('opacity-50', 'cursor-not-allowed');
         startText.textContent = 'Start Challenge';
+    }
+}
+
+function showSessionLoadingState(sessionId) {
+    const sessionStatusEl = document.getElementById('session-status');
+    if (sessionStatusEl) {
+        sessionStatusEl.classList.remove('hidden', 'invisible');
+    }
+    const sessionIdEl = document.getElementById('session-id');
+    if (sessionIdEl) {
+        sessionIdEl.textContent = sessionId;
+    }
+    const actionLog = document.getElementById('action-log');
+    if (actionLog) {
+        actionLog.innerHTML = '<div class="flex items-center justify-center flex-1"><p class="text-gray-500 text-center text-sm">Loading session log…</p></div>';
+    }
+}
+
+function updateUrlWithSession(sessionId) {
+    if (!sessionId || typeof history === 'undefined' || !history.replaceState) {
+        return;
+    }
+    const url = new URL(window.location.href);
+    url.searchParams.set('session', sessionId);
+    history.replaceState({}, '', url.toString());
+}
+
+function initFlagFormatPreference() {
+    if (flagPreferenceInitialized) {
+        return;
+    }
+    flagPreferenceInitialized = true;
+    refreshFlagFormatFromServer();
+}
+
+function applyFlagFormatDefault(value) {
+    const input = document.getElementById('flag_format');
+    if (!input) return;
+    const sanitized = value && value.trim() ? value.trim() : templateFlagFormat;
+    if (flagFormatTouched && input.value !== lastAppliedFlagDefault) {
+        return;
+    }
+    input.value = sanitized;
+    lastAppliedFlagDefault = sanitized;
+    flagFormatTouched = false;
+}
+
+async function refreshFlagFormatFromServer() {
+    try {
+        const response = await fetch('/settings/flag-format');
+        if (!response.ok) {
+            throw new Error('Failed to load default flag format');
+        }
+        const data = await response.json();
+        serverFlagFormat = (data.flag_format || templateFlagFormat).trim();
+        applyFlagFormatDefault(serverFlagFormat);
+    } catch (err) {
+        console.warn('Unable to fetch default flag format', err);
+        applyFlagFormatDefault(templateFlagFormat);
+    }
+}
+
+function persistSessionId(sessionId) {
+    try {
+        window.localStorage.setItem('currentSessionId', sessionId);
+    } catch (err) {
+        console.warn('Unable to persist session id', err);
+    }
+}
+
+function getPersistedSessionId() {
+    try {
+        return window.localStorage.getItem('currentSessionId');
+    } catch (err) {
+        console.warn('Unable to read persisted session id', err);
+        return null;
+    }
+}
+
+function clearPersistedSessionId() {
+    try {
+        window.localStorage.removeItem('currentSessionId');
+    } catch (err) {
+        console.warn('Unable to clear session id', err);
     }
 }
 
@@ -741,20 +955,26 @@ async function uploadHandouts() {
     }
 }
 
-function copyFlag() {
-    const flagText = document.getElementById('found-flag').textContent;
-    if (flagText) {
-        navigator.clipboard.writeText(flagText).then(() => {
-            // Show brief confirmation
-            const btn = event.target;
-            const originalText = btn.innerHTML;
-            btn.innerHTML = '<svg class="w-3 h-3 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg> Copied!';
-            setTimeout(() => { btn.innerHTML = originalText; }, 2000);
-        }).catch(err => { console.error('Failed to copy flag:', err); });
+async function copyFlag(event) {
+    const flagEl = document.getElementById('found-flag');
+    const flagText = flagEl ? String(flagEl.textContent || '').trim() : '';
+    if (!flagText) return;
+    const btn = event ? (event.currentTarget || event.target) : null;
+    const originalText = btn ? btn.innerHTML : '';
+    try {
+        const copied = await copyTextToClipboard(flagText);
+        if (!copied) {
+            throw new Error('Clipboard unavailable');
+        }
+        showButtonCopiedState(btn, originalText);
+        showTransientMessage('Flag copied to clipboard');
+    } catch (err) {
+        console.error('Failed to copy flag:', err);
+        showTransientMessage('Unable to copy flag', true);
     }
 }
 
-function copyActionFlag(event) {
+async function copyActionFlag(event) {
     try {
         const btn = event && (event.currentTarget || event.target);
         const wrapper = btn ? btn.closest('[data-action-id]') : null;
@@ -771,15 +991,69 @@ function copyActionFlag(event) {
         }
         if (!text) return;
         const originalText = btn ? btn.innerHTML : '';
-        navigator.clipboard.writeText(text).then(() => {
-            if (btn) {
-                btn.innerHTML = '<svg class="w-3 h-3 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg> Copied!';
-                setTimeout(() => { btn.innerHTML = originalText; }, 2000);
-            }
-        }).catch(() => { });
+        const copied = await copyTextToClipboard(text);
+        if (!copied) {
+            throw new Error('Clipboard unavailable');
+        }
+        showButtonCopiedState(btn, originalText);
+        showTransientMessage('Flag copied to clipboard');
     } catch (e) {
         console.error('copyActionFlag error', e);
+        showTransientMessage('Unable to copy flag', true);
     }
+}
+
+function showButtonCopiedState(btn, originalHTML) {
+    if (!btn) return;
+    btn.innerHTML = '<svg class="w-3 h-3 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg> Copied!';
+    setTimeout(() => {
+        btn.innerHTML = originalHTML;
+    }, 2000);
+}
+
+async function copyTextToClipboard(text) {
+    if (!text) return false;
+    try {
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+        return fallbackCopyText(text);
+    } catch (err) {
+        console.error('Clipboard write failed', err);
+        return false;
+    }
+}
+
+function fallbackCopyText(text) {
+    try {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'absolute';
+        textarea.style.left = '-9999px';
+        document.body.appendChild(textarea);
+        textarea.select();
+        const success = document.execCommand('copy');
+        document.body.removeChild(textarea);
+        return success;
+    } catch (err) {
+        console.error('Fallback copy failed', err);
+        return false;
+    }
+}
+
+function showTransientMessage(message, isError = false) {
+    if (!message) return;
+    const container = document.createElement('div');
+    container.textContent = message;
+    container.className = `fixed bottom-4 right-4 text-white text-sm px-4 py-2 rounded shadow-lg opacity-0 transition ${isError ? 'bg-red-600' : 'bg-gray-900'}`;
+    document.body.appendChild(container);
+    requestAnimationFrame(() => container.classList.remove('opacity-0'));
+    setTimeout(() => {
+        container.classList.add('opacity-0');
+        container.addEventListener('transitionend', () => container.remove(), { once: true });
+    }, 2000);
 }
 
 // Layout adjustment functions
@@ -813,6 +1087,9 @@ function resetLayoutAfterSession() {
     const challengeForm = document.getElementById('challenge-form');
     const collapseIcon = document.getElementById('collapse-icon');
     const expandIcon = document.getElementById('expand-icon');
+
+    // Stop any background polling to avoid unnecessary network calls
+    stopPolling();
 
     // Keep active layout to avoid jank when sessions start/stop
     mainGrid.className = 'grid grid-cols-1 xl:grid-cols-5 gap-4 flex-1';

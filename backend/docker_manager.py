@@ -2,10 +2,11 @@ import docker
 from docker.errors import ImageNotFound
 import asyncio
 import logging
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Callable, Coroutine
 from docker.models.containers import Container
 import json
 import uuid
+import time
 from pprint import pprint
 import shlex
 
@@ -91,106 +92,38 @@ class DockerManager:
         self, session_id: str, command: str, timeout: int = 30
     ) -> Dict[str, Any]:
         """Execute a command in the container."""
-        if session_id not in self.containers:
-            raise ValueError(f"No container found for session {session_id}")
-
-        container = self.containers[session_id]
-
-        try:
-            # Check container status before execution
-            container.reload()
-            if container.status != "running":
-                logger.error(
-                    f"Container {session_id} is not running: {container.status}"
-                )
-                return {
-                    "exit_code": -1,
-                    "stdout": "",
-                    "stderr": f"Container is not running (status: {container.status})",
-                    "success": False,
-                    "container_status": container.status,
-                }
-
-            logger.info(f"Executing command in {session_id}: {command}")
-
-            # Execute command - use shell for complex commands with pipes, &&, etc.
-            needs_shell = any(
-                op in command for op in ["&&", "||", "|", ">", "<", ";", "$(", "`"]
-            )
-
-            if needs_shell:
-                # Wrap command in shell for complex operations
-                exec_command = ["/bin/bash", "-c", command]
-                logger.debug(f"Using shell execution: {exec_command}")
-            else:
-                # Simple command can be executed directly, split safely
-                exec_command = shlex.split(command)
-                logger.debug(f"Using direct execution: {exec_command}")
-
-            exec_result = container.exec_run(
-                exec_command,
-                stdout=True,
-                stderr=True,
-                stdin=False,
-                tty=False,
-                detach=False,
-                demux=True,
-                workdir="/workspace",
-            )
-
-            stdout = (
-                exec_result.output[0].decode("utf-8") if exec_result.output[0] else ""
-            )
-            stderr = (
-                exec_result.output[1].decode("utf-8") if exec_result.output[1] else ""
-            )
-
-            logger.info(f"Command completed with exit code {exec_result.exit_code}")
-            # if stdout:
-            logger.debug(f"STDOUT: {stdout[:200]}...")
-            # if stderr:
-            logger.debug(f"STDERR: {stderr[:200]}...")
-
-            return {
-                "exit_code": exec_result.exit_code,
-                "stdout": stdout,
-                "stderr": stderr,
-                "success": exec_result.exit_code == 0,
-                "container_status": container.status,
-            }
-
-        except Exception as e:
-            logger.error(f"Command execution failed in session {session_id}: {e}")
-            return {
-                "exit_code": -1,
-                "stdout": "",
-                "stderr": f"Execution error: {str(e)}",
-                "success": False,
-                "container_status": "error",
-            }
+        return await self.execute_command_stream(
+            session_id=session_id,
+            command=command,
+            on_chunk=None,
+            timeout=float(timeout) if timeout is not None else None,
+        )
 
     async def execute_command_stream(
         self,
         session_id: str,
         command: str,
-        on_chunk,
-        timeout: int = 300,
+        on_chunk: Optional[Callable[[str, str], Coroutine[Any, Any, None]]] = None,
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Execute a command and stream output via an async callback.
-
-        on_chunk(channel: str, text: str) -> Awaitable[None]
-        channel is one of "stdout" | "stderr".
-        """
+        """Execute a command and optionally stream output via an async callback."""
         if session_id not in self.containers:
             raise ValueError(f"No container found for session {session_id}")
 
         container = self.containers[session_id]
+        stdout_acc: list[str] = []
+        stderr_acc: list[str] = []
+        timed_out = False
+        exec_id_holder: Dict[str, Optional[str]] = {"id": None}
+
+        async def _emit(channel: str, text: str) -> None:
+            if on_chunk:
+                await on_chunk(channel, text)
 
         try:
-            # Check container status before execution
             container.reload()
             if container.status != "running":
-                await on_chunk(
+                await _emit(
                     "stderr", f"Container is not running (status: {container.status})\n"
                 )
                 return {
@@ -199,29 +132,45 @@ class DockerManager:
                     "stderr": f"Container is not running (status: {container.status})",
                     "success": False,
                     "container_status": container.status,
+                    "timed_out": False,
                 }
 
             logger.info(f"Executing (stream) in {session_id}: {command}")
-
-            # Execute command - use shell for complex commands with pipes, &&, etc.
             needs_shell = any(
                 op in command for op in ["&&", "||", "|", ">", "<", ";", "$(", "`"]
             )
-            if needs_shell:
-                exec_command = ["/bin/bash", "-lc", command]
-            else:
-                exec_command = shlex.split(command)
-
-            stdout_acc: list[str] = []
-            stderr_acc: list[str] = []
+            exec_command = (
+                ["/bin/bash", "-lc", command] if needs_shell else shlex.split(command)
+            )
 
             import asyncio as _asyncio
 
             loop = _asyncio.get_running_loop()
 
+            chunk_callback = on_chunk
+
+            def _schedule_chunk(channel: str, text: str) -> None:
+                callback = chunk_callback
+                if callback is None:
+                    return
+
+                def _runner() -> None:
+                    loop.create_task(callback(channel, text))
+
+                loop.call_soon_threadsafe(_runner)
+
+            def _stop_exec(exec_id: Optional[str]) -> None:
+                if not exec_id:
+                    return
+                exec_stop = getattr(self.client.api, "exec_stop", None)
+                if callable(exec_stop):
+                    try:
+                        exec_stop(exec_id, timeout=0)
+                    except Exception:
+                        pass
+
             def _run_and_stream() -> int:
                 try:
-                    # Use low-level API for streaming
                     exec_id = self.client.api.exec_create(
                         container.id,
                         exec_command,
@@ -230,8 +179,8 @@ class DockerManager:
                         stdin=False,
                         tty=False,
                     )["Id"]
+                    exec_id_holder["id"] = exec_id
 
-                    # Start streaming
                     stream = self.client.api.exec_start(
                         exec_id, stream=True, demux=True
                     )
@@ -239,39 +188,70 @@ class DockerManager:
                         if out:
                             text = out.decode("utf-8", errors="replace")
                             stdout_acc.append(text)
-                            _asyncio.run_coroutine_threadsafe(
-                                on_chunk("stdout", text), loop
-                            )
+                            _schedule_chunk("stdout", text)
                         if err:
                             text = err.decode("utf-8", errors="replace")
                             stderr_acc.append(text)
-                            _asyncio.run_coroutine_threadsafe(
-                                on_chunk("stderr", text), loop
-                            )
+                            _schedule_chunk("stderr", text)
 
                     info = self.client.api.exec_inspect(exec_id)
                     code = info.get("ExitCode", -1)
                     return int(code if code is not None else -1)
                 except Exception as e:
-                    _asyncio.run_coroutine_threadsafe(
-                        on_chunk("stderr", f"Execution error: {e}\n"), loop
-                    )
+                    _schedule_chunk("stderr", f"Execution error: {e}\n")
                     return -1
 
-            exit_code: int = await _asyncio.to_thread(_run_and_stream)
+            effective_timeout: Optional[float] = None
+            if timeout is not None:
+                try:
+                    effective_timeout = max(0.0, float(timeout))
+                except (TypeError, ValueError):
+                    effective_timeout = None
+
+            if effective_timeout is not None and effective_timeout <= 0:
+                await _emit("stderr", "Command skipped: no time remaining\n")
+                return {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": "Command skipped: no time remaining",
+                    "success": False,
+                    "container_status": container.status,
+                    "timed_out": True,
+                }
+
+            runner = _asyncio.create_task(_asyncio.to_thread(_run_and_stream))
+
+            if effective_timeout:
+                done, _ = await _asyncio.wait({runner}, timeout=effective_timeout)
+                if runner in done:
+                    exit_code = runner.result()
+                else:
+                    timed_out = True
+                    exec_id = exec_id_holder.get("id")
+                    _stop_exec(exec_id)
+                    exit_code = await runner
+            else:
+                exit_code = await runner
+
+            success = exit_code == 0 and not timed_out
 
             return {
                 "exit_code": exit_code,
                 "stdout": "".join(stdout_acc),
                 "stderr": "".join(stderr_acc),
-                "success": exit_code == 0,
+                "success": success,
                 "container_status": container.status,
+                "timed_out": timed_out,
             }
 
+        except asyncio.CancelledError:
+            exec_id = exec_id_holder.get("id")
+            _stop_exec(exec_id)
+            raise
         except Exception as e:
             logger.error(f"Streaming execution failed in session {session_id}: {e}")
             try:
-                await on_chunk("stderr", f"Execution error: {str(e)}\n")
+                await _emit("stderr", f"Execution error: {str(e)}\n")
             except Exception:
                 pass
             return {
@@ -280,6 +260,7 @@ class DockerManager:
                 "stderr": f"Execution error: {str(e)}",
                 "success": False,
                 "container_status": "error",
+                "timed_out": False,
             }
 
     def _get_ctfuser_ids(self, session_id: str) -> Tuple[int, int]:

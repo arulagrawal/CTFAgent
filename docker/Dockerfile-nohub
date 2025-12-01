@@ -13,6 +13,9 @@ RUN apt-get update && apt-get install -y \
     # Basic utilities
     curl wget git vim nano tree file \
     sed \
+    vim-common \
+    openjdk-17-jdk \
+    tcpdump tshark \
     # Network tools
     nmap netcat-openbsd telnet dnsutils \
     # Web tools
@@ -39,6 +42,9 @@ RUN apt-get update && apt-get install -y \
     gdb llvm
     # && rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update && apt-get install -y \
+    # Cracking tools
+    hashid
 RUN apt-get install -y \
     postgresql-client 
 
@@ -58,7 +64,8 @@ RUN pip3 install --no-cache-dir --break-system-packages \
     lxml \
     numpy scipy \
     flask flask-unsign flask-unsign-wordlist itsdangerous \
-    angr capstone
+    angr capstone \
+    websockets
     # jupyter \
 
 # # Install additional tools via pip
