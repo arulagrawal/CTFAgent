@@ -16,6 +16,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ctf-data:/app/data
+      - ../data/writeups:/app/data/writeups
     depends_on:
       - ctf-solver-image
     networks:
