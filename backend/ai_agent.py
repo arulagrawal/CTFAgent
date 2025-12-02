@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from openai import AsyncOpenAI
 
-from .models import AgentAction, ChallengeType
+from .models import AgentAction, ChallengeType, WriteupResponse
 from .docker_manager import DockerManager
 from .llm_models import (
     get_model_info,
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 # Substrings that invalidate a matched flag candidate (case-insensitive)
-FLAG_CANDIDATE_BANNED_SUBSTRINGS = ("fake", "redacted", "test")
+FLAG_CANDIDATE_BANNED_SUBSTRINGS = ("fake", "redacted", "test", "placeholder")
 REASONING_EFFORT_CHOICES = ("low", "medium", "high")
 
 
@@ -747,6 +747,61 @@ class CTFAgent:
             + ("\n\n".join(specific_blocks) + ("\n" if specific_blocks else ""))
             + tail
         )
+
+    async def generate_writeup(
+        self,
+        session_id: str,
+        challenge_name: str,
+        challenge_type: str,
+        found_flag: str,
+        actions: List[AgentAction],
+    ) -> Optional[WriteupResponse]:
+        """Generate a write-up and solve script for a completed session."""
+        
+        # Collect session history
+        history_text = f"Challenge: {challenge_name}\n"
+        history_text += f"Type: {challenge_type}\n"
+        history_text += f"Flag Found: {found_flag}\n\n"
+        history_text += "Session Actions:\n"
+        for action in actions:
+            history_text += f"[{action.action_type}] {action.command or ''}\n"
+            if action.output:
+                history_text += f"Output: {action.output[:500]}...\n"  # Truncate output
+            history_text += "\n"
+
+        prompt = (
+            "You are an expert CTF player. Based on the session history below,"
+            "generate a write-up explaining how the challenge was solved."
+            "The write-up should be concise and to the point, with no fluff or unnecessary details."
+            "Do not provide mitigation steps or other non-essential information."
+            "Also provide a standalone Python solve script if applicable (using pwntools or requests as needed).\n\n"
+            f"{history_text}\n\n"
+            "Provide the output in a structured format with 'writeup' (markdown) and 'solve_script' (python code)."
+        )
+
+        logger.info(f"Generating write-up for {session_id}")
+
+        try:
+            # Use the agent's default model for write-up generation
+            response = await self.client.responses.parse(
+                model=self.api_string,
+                instructions="You are a helpful assistant that generates CTF write-ups.",
+                input=[{"role": "user", "content": prompt}],
+                max_output_tokens=2**14,
+                reasoning={"effort": "low"},
+                text={
+                    "verbosity": "low",
+                },
+                text_format=WriteupResponse,
+            )
+            
+            # We can't update session usage here easily since session object is gone from ai_agent,
+            # but that's acceptable for now.
+            
+            return response.output_parsed
+        except Exception as e:
+            logger.error(f"Failed to generate write-up: {e}")
+            return None
 
     def _build_analysis_prompt(
         self,

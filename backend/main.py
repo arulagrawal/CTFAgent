@@ -35,6 +35,7 @@ from .models import (
     AgentAction,
     WebSocketMessage,
 )
+
 from .ai_agent import CTFAgent, REASONING_EFFORT_CHOICES
 from .docker_manager import DockerManager
 from .llm_models import is_valid_model, get_api_string, get_available_models
@@ -64,6 +65,16 @@ def _save_flag_format_to_disk(value: str):
         FLAG_FORMAT_PATH.write_text(value, encoding="utf-8")
     except Exception as e:
         logger.warning(f"Failed to persist flag format: {e}")
+
+
+def _normalize_challenge_type(value: str | None) -> ChallengeType | None:
+    """Best-effort normalization of user-provided challenge type."""
+    if not value:
+        return None
+    try:
+        return ChallengeType(value.strip().lower())
+    except Exception:
+        return None
 
 
 current_flag_format = _load_flag_format_from_disk()
@@ -277,6 +288,9 @@ async def start_challenge(
     timeout_value = timeout or 600
     timeout_value = max(60, min(int(timeout_value), 1800))
 
+    # Normalize challenge type once for backend + agent usage
+    challenge_type_enum = _normalize_challenge_type(challenge_type)
+
     # Create session
     session = ChallengeSession(
         session_id=session_id,
@@ -284,6 +298,7 @@ async def start_challenge(
         host=host,
         port=port,
         challenge_name=challenge_name.strip() if challenge_name else None,
+        challenge_type=challenge_type_enum,
         flag_format=flag_format,
         found_flag=None,
         status=ChallengeStatus.PENDING,
@@ -318,7 +333,7 @@ async def start_challenge(
             host,
             port,
             flag_format,
-            challenge_type,
+            challenge_type_enum,
             challenge_name,
             description,
             timeout_value,
@@ -473,6 +488,75 @@ async def delete_challenge(session_id: str):
     return {"status": "deleted"}
 
 
+@app.post("/challenges/{session_id}/save")
+async def save_challenge_writeup(session_id: str):
+    """Generate and save a write-up and solve script for a completed session."""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = sessions[session_id]
+    if session.status != ChallengeStatus.COMPLETED:
+        raise HTTPException(
+            status_code=400, detail="Only completed sessions can be saved"
+        )
+
+    if not ai_agent:
+        raise HTTPException(status_code=500, detail="AI agent not initialized")
+
+    # Generate write-up
+    try:
+        session_challenge_type = getattr(session, "challenge_type", None)
+        found_flag_value = session.found_flag or "Unknown"
+        result = await ai_agent.generate_writeup(
+            session_id=session_id,
+            challenge_name=session.challenge_name or "Unknown",
+            challenge_type=(
+                session_challenge_type.value
+                if isinstance(session_challenge_type, ChallengeType)
+                else session_challenge_type
+                or "Unknown"
+            ),
+            found_flag=found_flag_value,
+            actions=session.actions,
+        )
+        if not result:
+            raise HTTPException(status_code=500, detail="Failed to generate write-up")
+    except Exception as e:
+        logger.error(f"Error generating write-up for {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Determine save directory
+    # Use challenge name if available, otherwise session ID
+    safe_name = session_id
+    if session.challenge_name:
+        # Sanitize challenge name for filesystem
+        safe_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", session.challenge_name)
+
+    save_dir = Path("data/writeups") / safe_name
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save files
+    saved_files = []
+    try:
+        writeup_path = save_dir / "writeup.md"
+        writeup_path.write_text(result.writeup, encoding="utf-8")
+        saved_files.append(str(writeup_path))
+
+        if result.solve_script:
+            script_path = save_dir / "solve.py"
+            script_path.write_text(result.solve_script, encoding="utf-8")
+            saved_files.append(str(script_path))
+    except Exception as e:
+        logger.error(f"Failed to save files for {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save files: {e}")
+
+    return {
+        "status": "saved",
+        "directory": str(save_dir),
+        "files": saved_files,
+    }
+
+
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     """WebSocket endpoint for real-time updates."""
@@ -496,7 +580,7 @@ async def solve_challenge_background_form(
     host: str | None,
     port: int | None,
     flag_format: str,
-    challenge_type: str | None,
+    challenge_type: ChallengeType | None,
     challenge_name: str | None,
     description: str | None,
     timeout: int,
@@ -570,15 +654,6 @@ async def solve_challenge_background_form(
                 except Exception as e:
                     logger.warning(f"Error copying handout {name} before start: {e}")
 
-        # Normalize challenge type string to enum when possible
-        ct_enum = None
-        try:
-            if challenge_type:
-                # Accept case-insensitive input matching enum values
-                ct_enum = ChallengeType(challenge_type.lower())
-        except Exception:
-            ct_enum = None
-
         actions = await asyncio.wait_for(
             ai_agent.solve_challenge(
                 session_id=session_id,
@@ -586,7 +661,7 @@ async def solve_challenge_background_form(
                 socket_host=host,
                 socket_port=port,
                 flag_format=flag_format,
-                challenge_type=ct_enum,  # type: ignore[arg-type]
+                challenge_type=challenge_type,
                 challenge_name=challenge_name,
                 description=description,
                 uploaded_files=session.uploaded_files,

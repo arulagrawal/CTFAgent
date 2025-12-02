@@ -47,6 +47,7 @@ class ChallengeSession(BaseModel):
     host: Optional[str] = None
     port: Optional[int] = None
     challenge_name: Optional[str] = None
+    challenge_type: Optional[ChallengeType] = None
     flag_format: str
     status: ChallengeStatus
     created_at: datetime
@@ -66,3 +67,8 @@ class WebSocketMessage(BaseModel):
     session_id: str
     data: Dict[str, Any]
     timestamp: datetime = datetime.now(timezone.utc)
+
+
+class WriteupResponse(BaseModel):
+    writeup: str
+    solve_script: Optional[str] = None

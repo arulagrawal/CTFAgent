@@ -1,5 +1,6 @@
 const DASHBOARD_REFRESH_MS = 5000;
 let refreshTimer = null;
+const activeWriteupSessions = new Map();
 
 (function initDashboard() {
     try {
@@ -26,6 +27,7 @@ async function fetchSessions(isManual = false) {
         }
         const data = await res.json();
         renderSessions(data.sessions || []);
+        updateWriteupBanner();
         if (isManual) {
             showTransientMessage('Manual refresh complete');
         }
@@ -38,14 +40,81 @@ async function fetchSessions(isManual = false) {
     }
 }
 
+function markWriteupActive(sessionId, label) {
+    if (!sessionId) return;
+    const entryLabel = (label || '').trim() || `session ${sessionId.slice(0, 8)}`;
+    activeWriteupSessions.set(sessionId, {
+        label: entryLabel,
+        startedAt: Date.now(),
+    });
+    updateWriteupBanner();
+}
+
+function clearWriteupActive(sessionId) {
+    if (!sessionId) return;
+    if (activeWriteupSessions.delete(sessionId)) {
+        updateWriteupBanner();
+    }
+}
+
+function isWriteupActive(sessionId) {
+    return activeWriteupSessions.has(sessionId);
+}
+
+function updateWriteupBanner() {
+    const statusEl = document.getElementById('dashboard-status');
+    const textEl = document.getElementById('dashboard-status-text');
+    if (!statusEl || !textEl) return;
+
+    if (!activeWriteupSessions.size) {
+        statusEl.classList.add('hidden');
+        textEl.textContent = '';
+        return;
+    }
+
+    const labels = Array.from(activeWriteupSessions.values()).map((entry) => entry.label);
+    let message = '';
+    if (labels.length === 1) {
+        message = `Generating write-up for ${labels[0]}…`;
+    } else {
+        message = `Generating write-ups for ${labels.length} sessions (${labels.join(', ')})…`;
+    }
+    textEl.textContent = message;
+    statusEl.classList.remove('hidden');
+}
+
+function cleanupWriteupState(sessions) {
+    if (!sessions || !sessions.length) {
+        if (activeWriteupSessions.size) {
+            activeWriteupSessions.clear();
+            updateWriteupBanner();
+        }
+        return;
+    }
+    const sessionMap = new Map(sessions.map((session) => [session.session_id, session]));
+    let mutated = false;
+    for (const sessionId of Array.from(activeWriteupSessions.keys())) {
+        const session = sessionMap.get(sessionId);
+        if (!session || session.status !== 'completed') {
+            activeWriteupSessions.delete(sessionId);
+            mutated = true;
+        }
+    }
+    if (mutated) {
+        updateWriteupBanner();
+    }
+}
+
 function renderSessions(sessions) {
     const body = document.getElementById('sessions-body');
     const emptyState = document.getElementById('empty-state');
     if (!body) return;
 
+    cleanupWriteupState(sessions);
     body.innerHTML = '';
     if (!sessions.length) {
         if (emptyState) emptyState.classList.remove('hidden');
+        updateWriteupBanner();
         return;
     }
     if (emptyState) emptyState.classList.add('hidden');
@@ -117,6 +186,8 @@ function renderFlagCell(session) {
 function renderActions(session) {
     const safeSessionId = escapeHtml(session.session_id);
     const viewBtn = `<button class="view-session inline-flex items-center px-3 py-1.5 border border-gray-300 rounded-md text-xs font-medium text-gray-700 hover:bg-gray-50" data-session="${safeSessionId}">View</button>`;
+    const isSaving = isWriteupActive(session.session_id);
+    const challengeLabel = encodeURIComponent(session.challenge_name || session.session_id);
 
     let actionBtn;
     if (session.status === 'running' || session.status === 'pending') {
@@ -125,10 +196,49 @@ function renderActions(session) {
         actionBtn = `<button class="delete-session inline-flex items-center px-3 py-1.5 border border-gray-300 rounded-md text-xs font-medium text-gray-700 hover:bg-red-50 hover:text-red-700 hover:border-red-300 transition" data-session="${safeSessionId}">Delete</button>`;
     }
 
+    let saveBtn = '';
+    if (session.status === 'completed') {
+        const saveClasses = [
+            'save-session',
+            'inline-flex',
+            'items-center',
+            'px-3',
+            'py-1.5',
+            'border',
+            'border-green-300',
+            'rounded-md',
+            'text-xs',
+            'font-medium',
+            'text-green-700',
+            'hover:bg-green-50',
+            'transition',
+        ];
+        if (isSaving) {
+            saveClasses.push('opacity-70', 'cursor-wait');
+        }
+        const spinner = isSaving
+            ? '<svg class="w-3 h-3 mr-1 text-green-700 animate-spin" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a12 12 0 00-12 12h4z"></path></svg>'
+            : '';
+        const saveLabel = isSaving ? 'Generating…' : 'Save';
+        const disabledAttr = isSaving ? 'disabled data-saving="true"' : '';
+        saveBtn = `<button class="${saveClasses.join(' ')}" data-session="${safeSessionId}" data-challenge="${challengeLabel}" ${disabledAttr}>${spinner}${saveLabel}</button>`;
+    }
+
+    const savingNotice = isSaving
+        ? `<div class="flex items-center text-xs text-blue-600 gap-1">
+                <span class="inline-flex w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse"></span>
+                <span>Generating write-up… this can take a minute.</span>
+           </div>`
+        : '';
+
     return `
-        <div class="flex flex-wrap gap-2">
-            ${viewBtn}
-            ${actionBtn}
+        <div class="flex flex-col gap-2">
+            <div class="flex flex-wrap gap-2">
+                ${viewBtn}
+                ${saveBtn}
+                ${actionBtn}
+            </div>
+            ${savingNotice}
         </div>
     `;
 }
@@ -208,6 +318,39 @@ function wireActionButtons() {
                 console.error('Delete failed', err);
                 alert(err.message || 'Failed to delete session');
             } finally {
+                fetchSessions();
+            }
+        });
+    });
+
+    document.querySelectorAll('.save-session').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+            const sessionId = btn.dataset.session;
+            if (!sessionId || btn.disabled || btn.dataset.saving === 'true') return;
+
+            const label = btn.dataset.challenge ? decodeURIComponent(btn.dataset.challenge) : sessionId;
+            btn.disabled = true;
+            btn.dataset.saving = 'true';
+            const originalContent = btn.innerHTML;
+            btn.innerHTML =
+                '<svg class="w-3 h-3 mr-1 text-green-700 animate-spin" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4l3-3-3-3v4a12 12 0 00-12 12h4z"></path></svg>Generating…';
+            markWriteupActive(sessionId, label);
+
+            try {
+                const res = await fetch(`/challenges/${sessionId}/save`, { method: 'POST' });
+                const data = await res.json();
+                if (!res.ok) {
+                    throw new Error(data.detail || 'Failed to save write-up');
+                }
+                showTransientMessage(`Saved to ${data.directory}`);
+            } catch (err) {
+                console.error('Save failed', err);
+                alert(err.message || 'Failed to save write-up');
+            } finally {
+                clearWriteupActive(sessionId);
+                btn.disabled = false;
+                btn.innerHTML = originalContent;
+                delete btn.dataset.saving;
                 fetchSessions();
             }
         });
