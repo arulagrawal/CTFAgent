@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 # Substrings that invalidate a matched flag candidate (case-insensitive)
-FLAG_CANDIDATE_BANNED_SUBSTRINGS = ("fake", "redacted", "test")
+FLAG_CANDIDATE_BANNED_SUBSTRINGS = ("fake", "redacted", "test", "placeholder")
 REASONING_EFFORT_CHOICES = ("low", "medium", "high")
 
 
@@ -772,6 +772,8 @@ class CTFAgent:
         prompt = (
             "You are an expert CTF player. Based on the session history below,"
             "generate a write-up explaining how the challenge was solved."
+            "The write-up should be concise and to the point, with no fluff or unnecessary details."
+            "Do not provide mitigation steps or other non-essential information."
             "Also provide a standalone Python solve script if applicable (using pwntools or requests as needed).\n\n"
             f"{history_text}\n\n"
             "Provide the output in a structured format with 'writeup' (markdown) and 'solve_script' (python code)."
@@ -786,8 +788,10 @@ class CTFAgent:
                 instructions="You are a helpful assistant that generates CTF write-ups.",
                 input=[{"role": "user", "content": prompt}],
                 max_output_tokens=2**14,
-                reasoning={"effort": "medium"},
-                verbosity="low",
+                reasoning={"effort": "low"},
+                text={
+                    "verbosity": "low",
+                },
                 text_format=WriteupResponse,
             )
             
