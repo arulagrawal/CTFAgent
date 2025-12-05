@@ -41,6 +41,12 @@ MODEL_REGISTRY: Dict[str, LLMModelInfo] = {
         price_input_per_1m=1.250,
         price_output_per_1m=10.000,
     ),
+    "gpt-5.1-codex": LLMModelInfo(
+        name="GPT-5.1 Codex",
+        api_string="gpt-5.1-codex",
+        price_input_per_1m=1.250,
+        price_output_per_1m=10.000,
+    ),
 }
 
 
