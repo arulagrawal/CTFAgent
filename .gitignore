@@ -53,7 +53,6 @@ logs/
 data/
 
 # Docker
-.dockerignore
 
 # Environment variables
 .env.local
