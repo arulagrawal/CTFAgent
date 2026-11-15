@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 class DockerManager:
     def __init__(self):
-        self.client = docker.from_env()
+        self.client = docker.from_env(timeout=15)
         self.containers: Dict[str, Container] = {}
         # Cache of (uid, gid) for ctfuser per session/container
         self._ctfuser_ids: Dict[str, Tuple[int, int]] = {}
@@ -52,7 +52,17 @@ class DockerManager:
                 "tmpfs": {"/tmp": "noexec,nosuid,size=100m"},
             }
 
-            container = self.client.containers.run(**container_config)
+            creation = asyncio.create_task(
+                asyncio.to_thread(self.client.containers.run, **container_config)
+            )
+            try:
+                container = await asyncio.shield(creation)
+            except asyncio.CancelledError:
+                # Docker creation cannot be cancelled once its worker has started.
+                container = await creation
+                self.containers[session_id] = container
+                await self.cleanup_container(session_id)
+                raise
             self.containers[session_id] = container
 
             # Wait a moment for container to fully start
@@ -60,7 +70,8 @@ class DockerManager:
 
             # Ensure /workspace and handouts dir are owned by ctfuser even with a fresh volume
             try:
-                container.exec_run(
+                await asyncio.to_thread(
+                    container.exec_run,
                     [
                         "/bin/bash",
                         "-c",
@@ -100,168 +111,92 @@ class DockerManager:
         )
 
     async def execute_command_stream(
-        self,
-        session_id: str,
-        command: str,
-        on_chunk: Optional[Callable[[str, str], Coroutine[Any, Any, None]]] = None,
-        timeout: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        """Execute a command and optionally stream output via an async callback."""
+        self, session_id, command, on_chunk=None, timeout=None, stop_event=None
+    ):
         if session_id not in self.containers:
-            raise ValueError(f"No container found for session {session_id}")
-
+            raise ValueError(f"No container found for {session_id}")
         container = self.containers[session_id]
-        stdout_acc: list[str] = []
-        stderr_acc: list[str] = []
+        loop = asyncio.get_running_loop()
+        queue = asyncio.Queue()
+        stdout, stderr = [], []
         timed_out = False
-        exec_id_holder: Dict[str, Optional[str]] = {"id": None}
+        stopped = False
 
-        async def _emit(channel: str, text: str) -> None:
-            if on_chunk:
-                await on_chunk(channel, text)
-
-        try:
-            container.reload()
-            if container.status != "running":
-                await _emit(
-                    "stderr", f"Container is not running (status: {container.status})\n"
-                )
-                return {
-                    "exit_code": -1,
-                    "stdout": "",
-                    "stderr": f"Container is not running (status: {container.status})",
-                    "success": False,
-                    "container_status": container.status,
-                    "timed_out": False,
-                }
-
-            logger.info(f"Executing (stream) in {session_id}: {command}")
-            needs_shell = any(
-                op in command for op in ["&&", "||", "|", ">", "<", ";", "$(", "`"]
-            )
-            exec_command = (
-                ["/bin/bash", "-lc", command] if needs_shell else shlex.split(command)
-            )
-
-            import asyncio as _asyncio
-
-            loop = _asyncio.get_running_loop()
-
-            chunk_callback = on_chunk
-
-            def _schedule_chunk(channel: str, text: str) -> None:
-                callback = chunk_callback
-                if callback is None:
-                    return
-
-                def _runner() -> None:
-                    loop.create_task(callback(channel, text))
-
-                loop.call_soon_threadsafe(_runner)
-
-            def _stop_exec(exec_id: Optional[str]) -> None:
-                if not exec_id:
-                    return
-                exec_stop = getattr(self.client.api, "exec_stop", None)
-                if callable(exec_stop):
-                    try:
-                        exec_stop(exec_id, timeout=0)
-                    except Exception:
-                        pass
-
-            def _run_and_stream() -> int:
-                try:
-                    exec_id = self.client.api.exec_create(
-                        container.id,
-                        exec_command,
-                        stdout=True,
-                        stderr=True,
-                        stdin=False,
-                        tty=False,
-                    )["Id"]
-                    exec_id_holder["id"] = exec_id
-
-                    stream = self.client.api.exec_start(
-                        exec_id, stream=True, demux=True
-                    )
-                    for out, err in stream:
-                        if out:
-                            text = out.decode("utf-8", errors="replace")
-                            stdout_acc.append(text)
-                            _schedule_chunk("stdout", text)
-                        if err:
-                            text = err.decode("utf-8", errors="replace")
-                            stderr_acc.append(text)
-                            _schedule_chunk("stderr", text)
-
-                    info = self.client.api.exec_inspect(exec_id)
-                    code = info.get("ExitCode", -1)
-                    return int(code if code is not None else -1)
-                except Exception as e:
-                    _schedule_chunk("stderr", f"Execution error: {e}\n")
-                    return -1
-
-            effective_timeout: Optional[float] = None
-            if timeout is not None:
-                try:
-                    effective_timeout = max(0.0, float(timeout))
-                except (TypeError, ValueError):
-                    effective_timeout = None
-
-            if effective_timeout is not None and effective_timeout <= 0:
-                await _emit("stderr", "Command skipped: no time remaining\n")
-                return {
-                    "exit_code": -1,
-                    "stdout": "",
-                    "stderr": "Command skipped: no time remaining",
-                    "success": False,
-                    "container_status": container.status,
-                    "timed_out": True,
-                }
-
-            runner = _asyncio.create_task(_asyncio.to_thread(_run_and_stream))
-
-            if effective_timeout:
-                done, _ = await _asyncio.wait({runner}, timeout=effective_timeout)
-                if runner in done:
-                    exit_code = runner.result()
-                else:
-                    timed_out = True
-                    exec_id = exec_id_holder.get("id")
-                    _stop_exec(exec_id)
-                    exit_code = await runner
-            else:
-                exit_code = await runner
-
-            success = exit_code == 0 and not timed_out
-
-            return {
-                "exit_code": exit_code,
-                "stdout": "".join(stdout_acc),
-                "stderr": "".join(stderr_acc),
-                "success": success,
-                "container_status": container.status,
-                "timed_out": timed_out,
-            }
-
-        except asyncio.CancelledError:
-            exec_id = exec_id_holder.get("id")
-            _stop_exec(exec_id)
-            raise
-        except Exception as e:
-            logger.error(f"Streaming execution failed in session {session_id}: {e}")
+        def produce():
             try:
-                await _emit("stderr", f"Execution error: {str(e)}\n")
-            except Exception:
+                ident = self.client.api.exec_create(
+                    container.id,
+                    ["/bin/bash", "-c", command],
+                    stdout=True,
+                    stderr=True,
+                    tty=False,
+                    user="ctfuser",
+                )["Id"]
+                for out, err in self.client.api.exec_start(
+                    ident, stream=True, demux=True
+                ):
+                    for channel, chunk in (("stdout", out), ("stderr", err)):
+                        if chunk:
+                            loop.call_soon_threadsafe(
+                                queue.put_nowait,
+                                (channel, chunk.decode("utf-8", errors="replace")),
+                            )
+                code = self.client.api.exec_inspect(ident).get("ExitCode")
+                return code if code is not None else -1
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        async def consume():
+            while True:
+                item = await queue.get()
+                if item is None:
+                    return
+                channel, text = item
+                (stdout if channel == "stdout" else stderr).append(text)
+                if on_chunk:
+                    await on_chunk(channel, text)
+
+        async def terminate():
+            try:
+                await asyncio.to_thread(container.kill)
+            except docker.errors.NotFound:
                 pass
-            return {
-                "exit_code": -1,
-                "stdout": "",
-                "stderr": f"Execution error: {str(e)}",
-                "success": False,
-                "container_status": "error",
-                "timed_out": False,
-            }
+            except docker.errors.APIError:
+                logger.debug("Container already stopped", exc_info=True)
+
+        runner = asyncio.create_task(asyncio.to_thread(produce))
+        consumer = asyncio.create_task(consume())
+        waiter = asyncio.create_task(stop_event.wait()) if stop_event else None
+        try:
+            tasks = {runner} | ({waiter} if waiter else set())
+            done, _ = await asyncio.wait(
+                tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+            timed_out = not done
+            stopped = bool(stop_event and stop_event.is_set())
+            if timed_out or stopped:
+                await terminate()
+            code = await runner
+            await consumer  # Flush every callback before finalizing the action.
+            if stop_event and stop_event.is_set() and not stopped:
+                stopped = True
+                await terminate()
+            return dict(
+                exit_code=code,
+                stdout="".join(stdout),
+                stderr="".join(stderr),
+                success=code == 0 and not timed_out,
+                timed_out=timed_out,
+                container_status="stopped" if stopped or timed_out else "running",
+            )
+        except BaseException:
+            await terminate()
+            await asyncio.gather(runner, consumer, return_exceptions=True)
+            raise
+        finally:
+            if waiter:
+                waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
 
     def _get_ctfuser_ids(self, session_id: str) -> Tuple[int, int]:
         """Lookup and cache the uid,gid for user 'ctfuser' inside the container."""
@@ -421,22 +356,22 @@ class DockerManager:
         if session_id in self.containers:
             container = self.containers[session_id]
             try:
-                container.stop(timeout=10)
-                container.remove()
+                await asyncio.to_thread(container.stop, timeout=2)
+                await asyncio.to_thread(container.remove, force=True)
                 logger.info(f"Cleaned up container for session {session_id}")
             except Exception as e:
                 logger.error(
                     f"Failed to cleanup container for session {session_id}: {e}"
                 )
             finally:
-                del self.containers[session_id]
+                self.containers.pop(session_id, None)
 
         # Remove the named volume created for this session's workspace
         try:
             vol_name = f"ctf-workspace-{session_id}"
             volume = self.client.volumes.get(vol_name)
             try:
-                volume.remove(force=True)
+                await asyncio.to_thread(volume.remove, force=True)
                 logger.info(f"Removed volume {vol_name} for session {session_id}")
             except Exception as ve:
                 logger.warning(
@@ -458,7 +393,7 @@ class DockerManager:
         container = self.containers[session_id]
         try:
             try:
-                container.kill()  # SIGKILL for immediate stop
+                await asyncio.to_thread(container.kill)  # SIGKILL for immediate stop
                 logger.info(f"Killed container for session {session_id}")
             except Exception as e:
                 logger.warning(
@@ -467,7 +402,7 @@ class DockerManager:
 
             if remove:
                 try:
-                    container.remove(force=True)
+                    await asyncio.to_thread(container.remove, force=True)
                     logger.info(
                         f"Removed container after kill for session {session_id}"
                     )
@@ -478,7 +413,7 @@ class DockerManager:
         finally:
             # Ensure we drop reference regardless of success
             try:
-                del self.containers[session_id]
+                self.containers.pop(session_id, None)
             except Exception:
                 pass
 
@@ -487,7 +422,7 @@ class DockerManager:
                 vol_name = f"ctf-workspace-{session_id}"
                 volume = self.client.volumes.get(vol_name)
                 try:
-                    volume.remove(force=True)
+                    await asyncio.to_thread(volume.remove, force=True)
                     logger.info(
                         f"Removed volume {vol_name} after kill for session {session_id}"
                     )
