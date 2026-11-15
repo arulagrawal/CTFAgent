@@ -1,40 +1,32 @@
-version: '3.8'
-
 services:
   ctf-agent:
     build:
       context: ..
       dockerfile: docker/Dockerfile-backend
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-5-mini}
-      - HOST=0.0.0.0
-      - PORT=8000
-      - DEBUG=${DEBUG:-false}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-6-luna}
+      OPENAI_SERVICE_TIER: ${OPENAI_SERVICE_TIER:-default}
+      HOST: 0.0.0.0
+      PORT: 8000
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ctf-data:/app/data
       - ../data/writeups:/app/data/writeups
     depends_on:
-      - ctf-solver-image
-    networks:
-      - ctf-network
-
-  # This service just builds the CTF solver image
+      ctf-solver-image:
+        condition: service_completed_successfully
   ctf-solver-image:
     build:
       context: .
-      dockerfile: Dockerfile-nohub
+      dockerfile: Dockerfile
+      target: ${SOLVER_TARGET:-standard}
+      args:
+        BASE_IMAGE: ${SOLVER_BASE_IMAGE:-ubuntu:24.04}
     image: ctf-agent:latest
-    command: /bin/true  # Exit immediately after build
-    networks:
-      - ctf-network
+    command: ["/bin/true"]
 
 volumes:
   ctf-data:
-
-networks:
-  ctf-network:
-    driver: bridge

@@ -60,13 +60,16 @@ class ChallengeSession(BaseModel):
         default_factory=list
     )  # Filenames available in /workspace/handouts
     estimated_cost_usd: Optional[float] = None
+    model: str = "gpt-6-luna"
+    reasoning_effort: Optional[str] = None
+    usage: Dict[str, Any] = Field(default_factory=dict)
 
 
 class WebSocketMessage(BaseModel):
     type: str  # "action", "status", "flag_found", "error"
     session_id: str
     data: Dict[str, Any]
-    timestamp: datetime = datetime.now(timezone.utc)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class WriteupResponse(BaseModel):

@@ -17,6 +17,8 @@ from .llm_models import (
     get_available_models,
 )
 from .session import Session
+from .llm_models import DEFAULT_MODEL, EFFORTS, validate_settings
+from .openai_gateway import structured_response, require_parsed
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -24,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Substrings that invalidate a matched flag candidate (case-insensitive)
 FLAG_CANDIDATE_BANNED_SUBSTRINGS = ("fake", "redacted", "test", "placeholder")
-REASONING_EFFORT_CHOICES = ("low", "medium", "high")
+REASONING_EFFORT_CHOICES = EFFORTS
 
 
 class SingleCommand(BaseModel):
@@ -33,7 +35,7 @@ class SingleCommand(BaseModel):
 
 
 class CTFAgent:
-    def __init__(self, openai_api_key: str, model: str = "gpt-5.1"):
+    def __init__(self, openai_api_key: str, model: str = DEFAULT_MODEL):
         # Validate and normalize model name
         if not is_valid_model(model):
             available_models = ", ".join(get_available_models().keys())
@@ -41,6 +43,9 @@ class CTFAgent:
                 f"Unknown model '{model}', using as-is. Available models: {available_models}"
             )
         self.client = AsyncOpenAI(api_key=openai_api_key)
+        self.service_tier = os.getenv("OPENAI_SERVICE_TIER", "default")
+        if self.service_tier not in ("default", "flex"):
+            raise ValueError("OPENAI_SERVICE_TIER must be default or flex")
         # Store the original model name for display, but use API string for API calls
         self.default_model = model
         self.model = self.default_model  # Backwards compatibility
@@ -71,8 +76,8 @@ class CTFAgent:
             challenge_type=challenge_type,
             challenge_name=challenge_name.strip() if challenge_name else None,
         )
-        session.set_reasoning_effort(
-            reasoning_effort, REASONING_EFFORT_CHOICES, REASONING_EFFORT_CHOICES[1]
+        _, session.reasoning_effort = validate_settings(
+            selected_model, reasoning_effort
         )
         session.set_deadline(timeout_seconds)
         session.set_handouts(uploaded_files or [])
@@ -94,30 +99,7 @@ class CTFAgent:
         if not session:
             return None
 
-        stats = session.usage
-        if not stats:
-            return None
-        try:
-            model_name = str(stats.get("model", session.model))
-            model_info = get_model_info(model_name)
-
-            if not model_info:
-                # Fallback to default pricing if model not found
-                logger.warning(
-                    f"Model '{model_name}' not found in registry, using default pricing"
-                )
-                price_in = 1.250  # USD per 1M input tokens
-                price_out = 10.000  # USD per 1M output tokens
-            else:
-                price_in = model_info.price_input_per_1m
-                price_out = model_info.price_output_per_1m
-
-            cost = (stats["input_tokens"] / 1_000_000) * price_in + (
-                stats["output_tokens"] / 1_000_000
-            ) * price_out
-            return round(cost, 6)
-        except Exception:
-            return None
+        return session.usage.get("estimated_cost_usd")
 
     def _build_usage_summary_action(self, session_id: str) -> Optional[AgentAction]:
         session = self._get_session(session_id)
@@ -384,7 +366,7 @@ class CTFAgent:
                     success=True,
                 )
                 actions.append(init_action)
-                await callback("action", init_action.dict())
+                await callback("action", init_action.model_dump())
 
             # Start with challenge analysis - let AI decide what tools it needs
             analysis_prompt = self._build_analysis_prompt(
@@ -397,9 +379,18 @@ class CTFAgent:
                 socket_port=socket_port,
             )
             analysis_actions = await self._execute_with_ai(
-                session_id, analysis_prompt, actions, callback
+                session_id, analysis_prompt, actions, callback, flag_format=flag_format
             )
             actions.extend(analysis_actions)
+            if any(
+                a.action_type in ("ai_error", "ai_empty_response")
+                for a in analysis_actions
+            ):
+                return actions
+
+            # If the analysis step already surfaced a flag, stop immediately
+            if any(a.action_type == "flag_found" for a in analysis_actions):
+                return actions
 
             # Iterative solving process (strict one-by-one)
             max_iterations = 50
@@ -416,7 +407,7 @@ class CTFAgent:
                     )
                     actions.append(flag_action)
                     if callback:
-                        await callback("flag_found", flag_action.dict())
+                        await callback("flag_found", flag_action.model_dump())
                     break
 
                 # Get next single action from AI
@@ -430,9 +421,22 @@ class CTFAgent:
                     socket_port=socket_port,
                 )
                 iteration_actions = await self._execute_with_ai(
-                    session_id, next_prompt, actions, callback
+                    session_id,
+                    next_prompt,
+                    actions,
+                    callback,
+                    flag_format=flag_format,
                 )
                 actions.extend(iteration_actions)
+                if any(
+                    a.action_type in ("ai_error", "ai_empty_response")
+                    for a in iteration_actions
+                ):
+                    break
+
+                # Stop immediately if this iteration found the flag
+                if any(a.action_type == "flag_found" for a in iteration_actions):
+                    break
 
                 # Add a small delay between iterations to ensure frontend updates
                 await asyncio.sleep(1)
@@ -447,7 +451,7 @@ class CTFAgent:
                 if usage_action:
                     actions.append(usage_action)
                     if callback:
-                        await callback("action", usage_action.dict())
+                        await callback("action", usage_action.model_dump())
             except Exception:
                 pass
             return actions
@@ -465,14 +469,14 @@ class CTFAgent:
             )
             actions.append(error_action)
             if callback:
-                await callback("error", error_action.dict())
+                await callback("error", error_action.model_dump())
             # Append usage summary on error
             try:
                 usage_action = self._build_usage_summary_action(session_id)
                 if usage_action:
                     actions.append(usage_action)
                     if callback:
-                        await callback("action", usage_action.dict())
+                        await callback("action", usage_action.model_dump())
             except Exception:
                 pass
             return actions
@@ -483,6 +487,7 @@ class CTFAgent:
         prompt: str,
         previous_actions: List[AgentAction],
         callback: Optional[Callable] = None,
+        flag_format: str = "flag{.*}",
     ) -> List[AgentAction]:
         """Execute AI-generated commands and return actions."""
         actions = []
@@ -490,6 +495,18 @@ class CTFAgent:
         if not session:
             logger.error(f"No session state found for {session_id}")
             return actions
+
+        # Pre-compile flag regex for streaming detection
+        try:
+            flag_regex = flag_format.replace(".*", ".*?")
+            flag_pattern = re.compile(flag_regex, re.IGNORECASE)
+        except Exception:
+            flag_pattern = None
+
+        stop_event = asyncio.Event()
+        search_buffer = ""
+        flag_found_value: Optional[str] = None
+        flag_action: Optional[AgentAction] = None
 
         try:
             # Use the provided prompt directly; it already contains any needed history
@@ -500,24 +517,25 @@ class CTFAgent:
                 if callback:
                     await callback("ai_status", {"thinking": True})
                 prev_id = session.last_response_id
-                _kwargs = {}
-                if prev_id:
-                    _kwargs["previous_response_id"] = prev_id
-                response = await self.client.responses.parse(
+                response = await structured_response(
+                    self.client,
                     model=session.api_string,
+                    schema=SingleCommand,
                     instructions=self._get_system_prompt(session_id),
                     input=[{"role": "user", "content": input_text}],
-                    max_output_tokens=2**14,
-                    reasoning=cast(Any, {"effort": session.reasoning_effort}),
-                    text_format=SingleCommand,
-                    service_tier="flex",
-                    **_kwargs,
+                    effort=session.reasoning_effort,
+                    tier=self.service_tier,
+                    previous_id=prev_id,
+                    timeout=session.remaining_time()
+                    if session.remaining_time() is not None
+                    else 120,
                 )
+                self._update_usage_from_response(session_id, response)
+                require_parsed(response)
                 if callback:
                     await callback("ai_status", {"thinking": False})
 
                 # Track usage for Responses API
-                self._update_usage_from_response(session_id, response)
                 # Update last response id for conversation continuation
                 try:
                     session.last_response_id = getattr(response, "id", None)
@@ -534,8 +552,11 @@ class CTFAgent:
                 )
                 actions.append(error_action)
                 if callback:
-                    await callback("action", error_action.dict())
+                    await callback("action", error_action.model_dump())
                 return actions
+            finally:
+                if callback:
+                    await callback("ai_status", {"thinking": False})
 
             # Use structured output directly (SingleCommand)
             output = response.output_parsed
@@ -556,7 +577,7 @@ class CTFAgent:
                 )
                 actions.append(error_action)
                 if callback:
-                    await callback("action", error_action.dict())
+                    await callback("action", error_action.model_dump())
                 return actions
             else:
                 command = output.command
@@ -578,13 +599,48 @@ class CTFAgent:
             )
             actions.append(action)
             if callback:
-                await callback("action_create", action.dict())
+                await callback("action_create", action.model_dump())
 
             async def on_chunk(channel: str, text: str):
+                nonlocal search_buffer, flag_found_value, flag_action
+
                 if channel == "stdout":
                     stdout_acc.append(text)
                 else:
                     stderr_acc.append(text)
+
+                # Streamed flag detection to avoid waiting for command completion
+                if (
+                    flag_pattern is not None
+                    and flag_found_value is None
+                    and channel in ("stdout", "stderr")
+                ):
+                    search_buffer += text
+                    if len(search_buffer) > 4000:
+                        search_buffer = search_buffer[-4000:]
+                    for match in flag_pattern.finditer(search_buffer):
+                        candidate = match.group(0)
+                        if all(
+                            banned not in candidate.lower()
+                            for banned in FLAG_CANDIDATE_BANNED_SUBSTRINGS
+                        ):
+                            flag_found_value = candidate
+                            flag_action = AgentAction(
+                                id=uuid.uuid4().hex,
+                                timestamp=datetime.now(timezone.utc),
+                                action_type="flag_found",
+                                output=candidate,
+                                reasoning="Flag pattern matched in streamed output",
+                                success=True,
+                            )
+                            actions.append(flag_action)
+                            # Stop the running command as soon as a flag is seen
+                            if not stop_event.is_set():
+                                stop_event.set()
+                            if callback:
+                                await callback("flag_found", flag_action.model_dump())
+                            break
+
                 if callback:
                     await callback(
                         "action_chunk",
@@ -593,7 +649,11 @@ class CTFAgent:
 
             command_timeout = session.command_timeout()
             result = await self.docker_manager.execute_command_stream(
-                session_id, command, on_chunk, timeout=command_timeout
+                session_id,
+                command,
+                on_chunk,
+                timeout=command_timeout,
+                stop_event=stop_event,
             )
 
             # Build final formatted output for persistence and post-processing
@@ -614,6 +674,10 @@ class CTFAgent:
             else:
                 output_parts.append("STDERR: (empty)")
 
+            if stop_event.is_set() and flag_found_value:
+                output_parts.append(
+                    "NOTICE: Command stopped early after flag detected in output"
+                )
             if result.get("timed_out"):
                 output_parts.append(
                     "FAILURE REASON: Command timed out before completion"
@@ -629,7 +693,7 @@ class CTFAgent:
             formatted_output = "\n\n".join(output_parts)
 
             action.output = formatted_output
-            action.success = bool(result.get("success"))
+            action.success = bool(result.get("success")) or bool(flag_found_value)
 
             if callback:
                 await callback(
@@ -659,7 +723,7 @@ class CTFAgent:
             actions.append(error_action)
             if callback:
                 # Emit as action to avoid front-end error banner for non-fatal AI issues
-                await callback("action", error_action.dict())
+                await callback("action", error_action.model_dump())
 
         return actions
 
@@ -755,9 +819,11 @@ class CTFAgent:
         challenge_type: str,
         found_flag: str,
         actions: List[AgentAction],
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> Optional[WriteupResponse]:
         """Generate a write-up and solve script for a completed session."""
-        
+
         # Collect session history
         history_text = f"Challenge: {challenge_name}\n"
         history_text += f"Type: {challenge_type}\n"
@@ -783,25 +849,21 @@ class CTFAgent:
 
         try:
             # Use the agent's default model for write-up generation
-            response = await self.client.responses.parse(
-                model=self.api_string,
-                instructions="You are a helpful assistant that generates CTF write-ups.",
+            response = await structured_response(
+                self.client,
+                model=model or self.default_model,
+                schema=WriteupResponse,
+                instructions="Generate a concise CTF write-up.",
                 input=[{"role": "user", "content": prompt}],
-                max_output_tokens=2**14,
-                reasoning={"effort": "low"},
-                text={
-                    "verbosity": "low",
-                },
-                text_format=WriteupResponse,
+                effort=reasoning_effort,
+                tier=self.service_tier,
+                timeout=120,
             )
-            
-            # We can't update session usage here easily since session object is gone from ai_agent,
-            # but that's acceptable for now.
-            
-            return response.output_parsed
+            return require_parsed(response)
+
         except Exception as e:
             logger.error(f"Failed to generate write-up: {e}")
-            return None
+            raise
 
     def _build_analysis_prompt(
         self,

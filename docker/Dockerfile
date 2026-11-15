@@ -1,99 +1,30 @@
-# CTF Agent Docker Image
-# This container includes tools commonly used in CTF challenges
-
-FROM ubuntu:24.04
-
-# Prevent interactive prompts during package installation
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
-
-# Install system packages and dependencies
-RUN apt-get update && apt-get install -y \
-    # Basic utilities
-    curl wget git vim nano tree file \
-    sed \
-    vim-common \
-    openjdk-17-jdk \
-    # Network tools
-    nmap netcat-openbsd telnet dnsutils \
-    # Web tools
-    # burpsuite-pro-free gobuster dirb nikto \
-    # Programming languages
-    python3 python3-pip python3-dev \
-    nodejs npm \
-    # Cryptography tools
-    openssl hashcat john \
-    # Reverse engineering tools
-    binutils  \
-    # Forensics tools
-    binwalk foremost\
-    # Steganography tools
-    steghide \
-    # Database tools
-    # sqlite3 mysql-client postgresql-client \
-    # Compression tools
-    unzip p7zip-full \
-    # Build tools
-    # gcc g++ make cmake \
-    # Other useful tools
-    jq xmlstarlet \
-    gdb llvm
-    # && rm -rf /var/lib/apt/lists/*
-
-# Set objdump to llvm-objdump (for multiarch support)
-RUN update-alternatives --install /usr/bin/objdump objdump /usr/bin/llvm-objdump 100
-
-# Install Python packages commonly used in CTFs
-RUN pip3 install --no-cache-dir --break-system-packages \
-    requests beautifulsoup4 \
-    pycryptodome cryptography \
-    pillow \
-    z3-solver \
-    pwntools \
-    scapy \
-    paramiko \
-    sqlparse \
-    lxml \
-    numpy scipy \
-    flask flask-unsign flask-unsign-wordlist itsdangerous \
-    angr capstone
-    # jupyter \
-
-# # Install additional tools via pip
-# RUN pip3 install --no-cache-dir \
-#     flask django \
-#     selenium \
-#     scrapy \
-#     base58 \
-#     qrcode
-
-# Install Node.js packages
-RUN npm install -g \
-    js-beautify \
-    eslint \
-    @babel/core @babel/cli
-
-# # Install additional reverse engineering tools
-# RUN wget -O /tmp/ghidra.zip https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_10.4_build/ghidra_10.4_20230928_linux_x86_64.zip \
-#     && unzip /tmp/ghidra.zip -d /opt/ \
-#     && mv /opt/ghidra_* /opt/ghidra \
-#     && rm /tmp/ghidra.zip
-
-# Create workspace directory
-RUN mkdir -p /workspace
+ARG BASE_IMAGE=ubuntu:24.04
+FROM mambaorg/micromamba:2.5.0 AS micromamba
+FROM node:24-bookworm-slim AS node
+FROM ${BASE_IMAGE} AS tools
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 TERM=xterm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl wget git vim nano tree file sed xxd openjdk-17-jdk-headless \
+    tcpdump tshark nmap netcat-openbsd telnet dnsutils python3 python3-venv python3-dev \
+    nodejs npm openssl hashcat john binutils binwalk foremost steghide unzip p7zip-full \
+    jq xmlstarlet gdb llvm hashid util-linux bsdextrautils postgresql-client \
+    build-essential cmake pkg-config libffi-dev libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN python3 -m venv /opt/ctf
+ENV PATH="/opt/ctf/bin:${PATH}"
+RUN pip install --no-cache-dir requests beautifulsoup4 pycryptodome cryptography pillow \
+    z3-solver pwntools scapy paramiko sqlparse lxml numpy scipy flask flask-unsign \
+    flask-unsign-wordlist itsdangerous angr capstone websockets websocket-client
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+RUN npm install -g js-beautify eslint @babel/core @babel/cli && npm cache clean --force
+RUN update-alternatives --install /usr/bin/objdump objdump /usr/bin/llvm-objdump 100 \
+    && useradd -m -s /bin/bash ctfuser && mkdir /workspace && chown ctfuser:ctfuser /workspace
 WORKDIR /workspace
-
-# Create a non-root user for security
-RUN useradd -m -s /bin/bash ctfuser && \
-    chown -R ctfuser:ctfuser /workspace
-
-# Set up environment
-ENV PATH="/opt/ghidra:${PATH}"
-ENV GHIDRA_INSTALL_DIR="/opt/ghidra"
-ENV TERM=xterm
-
-# Switch to non-root user
+FROM tools AS sage
+COPY --from=micromamba /bin/micromamba /usr/local/bin/micromamba
+RUN micromamba create -y -p /opt/sage -c conda-forge sage=10.10 && micromamba clean --all --yes \
+    && printf '#!/bin/sh\nexec /usr/local/bin/micromamba run -p /opt/sage sage "$@"\n' > /usr/local/bin/sage && chmod +x /usr/local/bin/sage
 USER ctfuser
-
-# Default command
+CMD ["/bin/bash"]
+FROM tools AS standard
+USER ctfuser
 CMD ["/bin/bash"]

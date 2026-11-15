@@ -26,6 +26,10 @@ from fastapi.encoders import jsonable_encoder
 from pathlib import Path
 from dotenv import load_dotenv
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
+from dataclasses import asdict
+from urllib.parse import urlsplit
+from .llm_models import DEFAULT_MODEL, validate_settings
 
 from .models import (
     ChallengeRequest,
@@ -40,7 +44,8 @@ from .ai_agent import CTFAgent, REASONING_EFFORT_CHOICES
 from .docker_manager import DockerManager
 from .llm_models import is_valid_model, get_api_string, get_available_models
 
-DEFAULT_FLAG_FORMAT = "SCF2024-[A-Za-z0-9-_]{10,}"
+logger = logging.getLogger(__name__)
+DEFAULT_FLAG_FORMAT = r"flag\{[^}\r\n]+\}"
 FLAG_FORMAT_PATH = Path("data/settings/flag_format.txt")
 flag_format_lock = asyncio.Lock()
 
@@ -93,7 +98,7 @@ load_dotenv()
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -129,47 +134,89 @@ websocket_connections: Dict[str, WebSocket] = {}
 # Track background tasks by session for cancellation
 background_tasks: Dict[str, asyncio.Task] = {}
 
-# Initialize AI agent
-try:
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    if not openai_api_key:
-        raise ValueError("OPENAI_API_KEY environment variable is required")
+ai_agent = None
 
-    model_from_env = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-    if not is_valid_model(model_from_env):
-        logger.warning(
-            f"Invalid model '{model_from_env}' from OPENAI_MODEL env var, using 'gpt-5-mini'"
+
+@asynccontextmanager
+async def lifespan(app):
+    global ai_agent
+    key = os.getenv("OPENAI_API_KEY")
+    if key:
+        try:
+            ai_agent = await asyncio.to_thread(
+                CTFAgent, key, os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
+            )
+        except Exception:
+            logger.exception("Agent initialization failed")
+    try:
+        yield
+    finally:
+        tasks = list(background_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if ai_agent:
+            for session_id in list(ai_agent.docker_manager.containers):
+                await ai_agent.docker_manager.cleanup_container(session_id)
+            await ai_agent.client.close()
+            ai_agent.docker_manager.client.close()
+        ai_agent = None
+
+
+app.router.lifespan_context = lifespan
+
+
+def safe_upload_name(name):
+    if (
+        not name
+        or name in (".", "..")
+        or "/" in name
+        or "\\" in name
+        or any(ord(c) < 32 for c in name)
+    ):
+        raise HTTPException(
+            400, "Upload filenames must be plain filenames without paths."
         )
-        model_from_env = "gpt-5-mini"
+    return name
 
-    ai_agent = CTFAgent(openai_api_key=openai_api_key, model=model_from_env)
-except Exception as e:
-    logger.error(f"Failed to initialize AI agent: {e}")
-    ai_agent = None
-    sys.exit(1)
+
+@app.get("/models")
+async def models_catalog():
+    return {
+        "models": [asdict(m) for m in get_available_models().values()],
+        "default_model": os.getenv("OPENAI_MODEL", DEFAULT_MODEL),
+        "default_reasoning_effort": None,
+        "service_tier": os.getenv("OPENAI_SERVICE_TIER", "default"),
+    }
 
 
 class WebSocketManager:
     def __init__(self):
-        self.active_connections: Dict[str, WebSocket] = {}
+        self.active_connections: Dict[str, set[WebSocket]] = {}
 
     async def connect(self, websocket: WebSocket, session_id: str):
         await websocket.accept()
-        self.active_connections[session_id] = websocket
+        self.active_connections.setdefault(session_id, set()).add(websocket)
         logger.info(f"WebSocket connected for session {session_id}")
 
-    def disconnect(self, session_id: str):
-        if session_id in self.active_connections:
-            del self.active_connections[session_id]
-            logger.info(f"WebSocket disconnected for session {session_id}")
+    def disconnect(self, session_id, websocket):
+        peers = self.active_connections.get(session_id, set())
+        peers.discard(websocket)
+        if not peers:
+            self.active_connections.pop(session_id, None)
 
-    async def send_message(self, session_id: str, message: WebSocketMessage):
-        if session_id in self.active_connections:
+    async def send_message(self, session_id, message):
+        async def send(peer):
             try:
-                await self.active_connections[session_id].send_text(message.json())
-            except Exception as e:
-                logger.error(f"Failed to send WebSocket message to {session_id}: {e}")
-                self.disconnect(session_id)
+                await asyncio.wait_for(
+                    peer.send_text(message.model_dump_json()), timeout=5
+                )
+            except Exception:
+                self.disconnect(session_id, peer)
+
+        await asyncio.gather(
+            *(send(p) for p in tuple(self.active_connections.get(session_id, ())))
+        )
 
 
 websocket_manager = WebSocketManager()
@@ -178,8 +225,9 @@ websocket_manager = WebSocketManager()
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
     return templates.TemplateResponse(
+        request,
         "index.html",
-        {"request": request, "default_flag_format": get_current_flag_format()},
+        {"default_flag_format": get_current_flag_format()},
     )
 
 
@@ -187,8 +235,9 @@ async def root(request: Request):
 async def dashboard(request: Request):
     """Render the multi-session dashboard."""
     return templates.TemplateResponse(
+        request,
         "dashboard.html",
-        {"request": request, "default_flag_format": get_current_flag_format()},
+        {"default_flag_format": get_current_flag_format()},
     )
 
 
@@ -245,8 +294,8 @@ async def start_challenge(
     challenge_name: str | None = Form(None),
     description: str | None = Form(None),
     timeout: int = Form(600),
-    model: str = Form("gpt-5-mini"),
-    reasoning_effort: str = Form("low"),
+    model: str | None = Form(None),
+    reasoning_effort: str | None = Form(None),
     handouts: List[UploadFile] | None = None,
 ):
     """Start a new CTF challenge solving session."""
@@ -271,18 +320,24 @@ async def start_challenge(
     except re.error as e:
         raise HTTPException(status_code=400, detail=f"Invalid flag regex: {e}")
 
-    # Validate model name
-    if not is_valid_model(model):
-        available_models = ", ".join(get_available_models().keys())
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid model '{model}'. Available models: {available_models}",
+    try:
+        model, reasoning_effort_value = validate_settings(
+            model or os.getenv("OPENAI_MODEL", DEFAULT_MODEL), reasoning_effort
         )
-
-    # Normalize reasoning effort selection
-    reasoning_effort_value = (reasoning_effort or "").strip().lower()
-    if reasoning_effort_value not in REASONING_EFFORT_CHOICES:
-        reasoning_effort_value = REASONING_EFFORT_CHOICES[0]
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if url:
+        parsed = urlsplit(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise HTTPException(400, "Provide an HTTP or HTTPS URL.")
+    if (host is None) != (port is None) or (
+        port is not None and not 1 <= port <= 65535
+    ):
+        raise HTTPException(400, "Provide a host and port between 1 and 65535.")
+    if host and (any(c.isspace() for c in host) or "/" in host):
+        raise HTTPException(400, "Provide a hostname or IP address.")
+    for upload in handouts or []:
+        safe_upload_name(upload.filename)
 
     # Normalize timeout with sane bounds
     timeout_value = timeout or 600
@@ -305,6 +360,8 @@ async def start_challenge(
         created_at=datetime.now(timezone.utc),
         updated_at=datetime.now(timezone.utc),
         uploaded_files=[],
+        model=model,
+        reasoning_effort=reasoning_effort_value,
     )
 
     sessions[session_id] = session
@@ -316,7 +373,7 @@ async def start_challenge(
         for file in handouts:
             try:
                 content = await file.read()
-                safe_name = file.filename or f"upload_{uuid.uuid4().hex}"
+                safe_name = safe_upload_name(file.filename)
                 dest_path = os.path.join(base_dir, safe_name)
                 with open(dest_path, "wb") as f:
                     f.write(content)
@@ -357,7 +414,7 @@ async def upload_handout(session_id: str, file: UploadFile = File(...)):
     # Save to backend storage under data/handouts/{session_id}/
     base_dir = os.path.join("data", "handouts", session_id)
     os.makedirs(base_dir, exist_ok=True)
-    safe_name = file.filename or f"upload_{uuid.uuid4().hex}"
+    safe_name = safe_upload_name(file.filename)
     dest_path = os.path.join(base_dir, safe_name)
     try:
         content = await file.read()
@@ -416,7 +473,7 @@ async def stop_challenge(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
 
     session = sessions[session_id]
-    if session.status == ChallengeStatus.RUNNING:
+    if session.status in (ChallengeStatus.PENDING, ChallengeStatus.RUNNING):
         # 1) Hard-kill the container immediately (non-blocking)
         try:
             if ai_agent:
@@ -513,11 +570,12 @@ async def save_challenge_writeup(session_id: str):
             challenge_type=(
                 session_challenge_type.value
                 if isinstance(session_challenge_type, ChallengeType)
-                else session_challenge_type
-                or "Unknown"
+                else session_challenge_type or "Unknown"
             ),
             found_flag=found_flag_value,
             actions=session.actions,
+            model=session.model,
+            reasoning_effort=session.reasoning_effort,
         )
         if not result:
             raise HTTPException(status_code=500, detail="Failed to generate write-up")
@@ -565,13 +623,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     try:
         while True:
             # Keep connection alive
-            data = await websocket.receive_text()
-
-            # Echo back for now (could handle client commands)
-            await websocket.send_text(f"Echo: {data}")
+            await websocket.receive_text()
 
     except WebSocketDisconnect:
-        websocket_manager.disconnect(session_id)
+        websocket_manager.disconnect(session_id, websocket)
 
 
 async def solve_challenge_background_form(
@@ -598,7 +653,39 @@ async def solve_challenge_background_form(
     async def websocket_callback(event_type: str, data: dict):
         # Maintain session actions and forward messages
         try:
-            if event_type in ("action", "action_create") and "timestamp" in data:
+            if event_type == "flag_found":
+                try:
+                    action = AgentAction(**data)
+                except Exception:
+                    action = AgentAction(
+                        id=data.get("id") or str(uuid.uuid4().hex),
+                        timestamp=datetime.now(timezone.utc),
+                        action_type="flag_found",
+                        output=data.get("output"),
+                        reasoning=data.get("reasoning", ""),
+                        success=True,
+                    )
+                if not getattr(action, "id", None):
+                    action.id = str(uuid.uuid4().hex)
+                session.actions.append(action)
+                session.found_flag = action.output
+                session.status = ChallengeStatus.COMPLETED
+                session.updated_at = datetime.now(timezone.utc)
+                # Push a status update immediately so the UI reflects the solved state
+                asyncio.create_task(
+                    websocket_manager.send_message(
+                        session_id,
+                        WebSocketMessage(
+                            type="status",
+                            session_id=session_id,
+                            data={
+                                "status": session.status,
+                                "found_flag": session.found_flag,
+                            },
+                        ),
+                    )
+                )
+            elif event_type in ("action", "action_create") and "timestamp" in data:
                 action = AgentAction(**data)
                 # Ensure id presence
                 if not getattr(action, "id", None):
@@ -610,6 +697,11 @@ async def solve_challenge_background_form(
                 logger.info(
                     f"Added action to session {session_id}: {data.get('action_type', 'unknown')}"
                 )
+            elif event_type == "action_chunk" and data.get("id"):
+                for action in session.actions:
+                    if action.id == data["id"]:
+                        action.output = (action.output or "") + data.get("chunk", "")
+                        break
             elif event_type == "action_complete" and data.get("id"):
                 # Update the existing action's output/success
                 for a in session.actions:
@@ -626,33 +718,12 @@ async def solve_challenge_background_form(
 
         message = WebSocketMessage(type=event_type, session_id=session_id, data=data)
         logger.info(f"Sending WebSocket message: {event_type} for session {session_id}")
-        asyncio.create_task(websocket_manager.send_message(session_id, message))
+        await websocket_manager.send_message(session_id, message)
 
     try:
         # Start solving
         if not ai_agent:
             raise RuntimeError("AI agent not initialized")
-
-        # Ensure any pre-uploaded handouts are copied into container before starting
-        if session.uploaded_files:
-            base_dir = os.path.join("data", "handouts", session_id)
-            try:
-                await ai_agent.ensure_handout_dir(session_id)
-            except Exception:
-                pass
-            for name in session.uploaded_files:
-                host_path = os.path.join(base_dir, name)
-                dest_path = f"/workspace/handouts/{name}"
-                try:
-                    ok = await ai_agent.copy_host_file_to_container(
-                        session_id, host_path, dest_path
-                    )
-                    if not ok:
-                        logger.warning(
-                            f"Pre-copy failed for {name} in session {session_id}"
-                        )
-                except Exception as e:
-                    logger.warning(f"Error copying handout {name} before start: {e}")
 
         actions = await asyncio.wait_for(
             ai_agent.solve_challenge(
@@ -699,7 +770,14 @@ async def solve_challenge_background_form(
             session.status = ChallengeStatus.COMPLETED
         else:
             session.status = ChallengeStatus.FAILED
-            session.error_message = "Flag not found within time limit"
+            session.error_message = next(
+                (
+                    a.output
+                    for a in reversed(actions)
+                    if a.action_type in ("ai_error", "ai_empty_response", "error")
+                ),
+                "Flag not found within the iteration limit",
+            )
 
     except asyncio.TimeoutError:
         logger.error(f"Challenge solving timed out for session {session_id}")
@@ -721,7 +799,7 @@ async def solve_challenge_background_form(
                 WebSocketMessage(
                     type="action",
                     session_id=session_id,
-                    data=timeout_action.dict(),
+                    data=timeout_action.model_dump(),
                 ),
             )
         )
@@ -747,7 +825,7 @@ async def solve_challenge_background_form(
                             WebSocketMessage(
                                 type="action",
                                 session_id=session_id,
-                                data=usage_action.dict(),
+                                data=usage_action.model_dump(),
                             ),
                         )
                     )
@@ -777,7 +855,7 @@ async def solve_challenge_background_form(
                             WebSocketMessage(
                                 type="action",
                                 session_id=session_id,
-                                data=usage_action.dict(),
+                                data=usage_action.model_dump(),
                             ),
                         )
                     )
@@ -834,6 +912,17 @@ async def solve_challenge_background_form(
         asyncio.create_task(websocket_manager.send_message(session_id, error_message))
 
     finally:
+        if ai_agent:
+            state = ai_agent._get_session(session_id)
+            if state:
+                session.usage = dict(state.usage)
+                session.estimated_cost_usd = state.usage.get("estimated_cost_usd")
+        await websocket_manager.send_message(
+            session_id,
+            WebSocketMessage(
+                type="status", session_id=session_id, data=jsonable_encoder(session)
+            ),
+        )
         # Clean up container
         try:
             if ai_agent:
@@ -852,7 +941,7 @@ async def solve_challenge_background_form(
 if __name__ == "__main__":
     import uvicorn
 
-    host = os.getenv("HOST", "0.0.0.0")
+    host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", 8000))
     debug = os.getenv("DEBUG", "false").lower() == "true"
 

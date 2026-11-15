@@ -12,7 +12,7 @@ class Session:
     session_id: str
     model: str
     api_string: str
-    reasoning_effort: str = "low"
+    reasoning_effort: Optional[str] = None
     challenge_type: Optional[ChallengeType] = None
     challenge_name: Optional[str] = None
     handout_dir_ready: bool = False
@@ -87,6 +87,15 @@ class Session:
             stats["output_tokens"] += int(output_tokens)
             stats["total_tokens"] += int(total_tokens)
 
+            from .llm_models import estimate_response
+
+            cost = estimate_response(self.model, response)
+            if "estimated_cost_usd" not in stats:
+                stats["estimated_cost_usd"] = cost
+            elif cost is None or stats["estimated_cost_usd"] is None:
+                stats["estimated_cost_usd"] = None
+            else:
+                stats["estimated_cost_usd"] += cost
             self.usage = stats
         except Exception:
             # Best effort; ignore metering errors

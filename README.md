@@ -1,212 +1,86 @@
 # CTF Agent
 
-An AI-powered agent for solving Capture The Flag (CTF) challenges automatically. The system uses OpenAI's GPT-4o-mini model to analyze challenges and execute commands in a secure Docker environment.
+CTF Agent runs an OpenAI-powered solver in a dedicated Ubuntu Docker container. Submit a URL, a socket host and port, or handout files, then follow commands and output in the browser. The dashboard collects session status, flags, and write-up actions.
 
-## Features
+## Run locally
 
-- **Intelligent AI Agent**: Dynamic problem-solving approach that adapts to different challenge types
-- **Web-based Interface**: Clean, modern UI for submitting challenges and monitoring progress
-- **Real-time Observability**: Live WebSocket updates showing every action the AI agent takes
-- **Docker Isolation**: Secure, isolated environment with pre-installed CTF tools
-- **Multi-challenge Support**: Handles web, crypto, reverse engineering, forensics, and other challenge types
-- **Smart Challenge Detection**: Auto-detects challenge type from URL patterns and context
-- **Strategic Problem Solving**: AI follows reconnaissance → analysis → exploitation methodology
-- **Flag Detection**: Automatic flag detection using customizable regex patterns
-- **Cost Efficient**: Uses GPT-4o-mini to minimize API costs while maintaining effectiveness
+Install Docker with Compose, then run these commands from the repository root:
 
-## Architecture
-
-- **Web Interface**: FastAPI with Jinja2 templates and Tailwind CSS
-- **Backend**: FastAPI (Python) with Docker integration and OpenAI client
-- **AI Model**: OpenAI GPT-4o-mini for cost-effective challenge solving
-- **Container**: Ubuntu-based Docker image with comprehensive CTF toolset
-- **Communication**: WebSocket for real-time updates
-
-## Quick Start
-
-### Prerequisites
-
-- Docker and Docker Compose
-- OpenAI API key
-- uv (Python package manager)
-
-### Setup
-
-1. **Clone and setup environment**:
-   ```bash
-   git clone <repository-url>
-   cd CTFAgent
-   cp .env.example .env
-   ```
-
-2. **Configure environment variables**:
-   ```bash
-   # Edit .env file
-   OPENAI_API_KEY=your_openai_api_key_here
-   OPENAI_MODEL=gpt-4o-mini
-   ```
-
-3. **Build and run with Docker Compose**:
-   ```bash
-   docker-compose -f docker/docker-compose.yml up --build
-   ```
-
-4. **Access the application**:
-   - Web Interface: http://localhost:8000
-   - API Documentation: http://localhost:8000/docs
-
-### Manual Setup (Development)
-
-1. **Setup and run**:
-   ```bash
-   uv pip install -e .
-   docker build -t ctf-agent:latest -f docker/Dockerfile docker/
-   python -m backend.main
-   ```
-
-2. **Or use the development script**:
-   ```bash
-   ./dev.sh
-   ```
-
-## Usage
-
-1. **Start a Challenge**:
-   - Enter the challenge URL
-   - Specify the flag format (regex pattern, e.g., `flag{.*}`)
-   - Optionally set challenge type and description
-   - Choose the reasoning effort (Low, Medium, High) for model planning depth
-   - Click "Start Challenge"
-
-2. **Monitor Progress**:
-   - Watch real-time action logs in the right panel
-   - See AI reasoning for each step
-   - Monitor command execution and outputs
-   - Track session status and duration
-
-3. **Results**:
-   - Flag automatically detected when found
-   - Session completes with success/failure status
-   - Full action history preserved for analysis
-
-## How the AI Agent Works
-
-The AI agent uses a sophisticated problem-solving approach:
-
-### 1. **Challenge Analysis**
-- Auto-detects challenge type from URL patterns
-- Analyzes the target to understand the attack surface
-- Selects appropriate tools and techniques
-
-### 2. **Strategic Reconnaissance** 
-- Gathers initial intelligence about the target
-- Uses tools like `curl`, `nmap`, `gobuster` based on challenge type
-- Builds understanding of potential vulnerabilities
-
-### 3. **Adaptive Exploitation**
-- Forms hypotheses about potential attack vectors
-- Tests specific vulnerabilities systematically
-- Adapts approach based on findings
-
-### 4. **Continuous Learning**
-- Each command builds on previous findings
-- AI explains its reasoning for every action
-- Automatically searches all outputs for flag patterns
-
-## Example Workflow
-
-For a web challenge at `https://example-ctf.com/web1`:
-
-1. **Analysis**: AI detects this as a web challenge from URL
-2. **Reconnaissance**: Performs initial HTTP requests to understand the application
-3. **Discovery**: Enumerates directories, analyzes source code, checks headers
-4. **Vulnerability Assessment**: Tests for SQL injection, XSS, file inclusion, etc.
-5. **Exploitation**: Attempts to exploit discovered vulnerabilities
-6. **Flag Extraction**: Searches all command outputs for the flag pattern
-7. **Reporting**: Provides detailed logs of the entire process
-
-## CTF Tools Included
-
-The Docker container includes:
-
-**Web Tools**: curl, wget, burpsuite, gobuster, dirb, nikto
-**Programming**: Python 3, Node.js, pip packages (requests, beautifulsoup4, pwntools)
-**Crypto**: openssl, hashcat, john, pycryptodome
-**Reverse Engineering**: gdb, radare2, ghidra, binutils
-**Forensics**: binwalk, foremost, strings, hexdump
-**Steganography**: steghide, stegsolve
-**Network**: nmap, netcat, telnet, dnsutils
-
-## API Endpoints
-
-- `POST /challenges/start` - Start new challenge
-- `GET /challenges/{session_id}` - Get session status
-- `GET /challenges/{session_id}/actions` - Get action history
-- `POST /challenges/{session_id}/stop` - Stop running session
-- `DELETE /challenges/{session_id}` - Delete session
-- `WS /ws/{session_id}` - WebSocket for real-time updates
-
-## Security
-
-- Docker containers run with limited privileges
-- Non-root user execution
-- Network isolation
-- Resource limits
-- Automatic cleanup of containers
-
-## Development
-
-### Project Structure
-
-```
-CTFAgent/
-├── backend/           # FastAPI backend
-│   ├── main.py       # Main application
-│   ├── models.py     # Pydantic models
-│   ├── ai_agent.py   # AI agent logic
-│   └── docker_manager.py # Docker integration
-├── frontend/         # React frontend
-│   ├── src/
-│   │   ├── components/
-│   │   ├── hooks/
-│   │   └── types/
-├── docker/          # Docker configurations
-│   ├── Dockerfile   # CTF tools container
-│   ├── Dockerfile-backend
-│   └── docker-compose.yml
-└── pyproject.toml   # Python dependencies
+```sh
+cp .env.example .env
+# Set OPENAI_API_KEY in .env.
+docker compose --env-file .env -f docker/docker-compose.yml up --build
 ```
 
-### Contributing
+Open [the workspace](http://localhost:8000), [sessions](http://localhost:8000/dashboard), or [API documentation](http://localhost:8000/docs). The interface uses local assets and supports system, light, and dark themes.
 
-1. Fork the repository
-2. Create a feature branch
-3. Make changes and test thoroughly
-4. Submit a pull request
+The app is intended for personal, local use. Compose binds to localhost. The backend controls Docker through its socket; it has no authentication and should not be exposed publicly. Solver commands run as `ctfuser`, with a separate workspace volume for each session. Use it for challenges you are authorized to solve.
 
-## Limitations
+## Models and settings
 
-- Currently optimized for web challenges
-- Requires OpenAI API access
-- Docker dependency for isolation
-- Limited to challenges accessible via HTTP/HTTPS
+`OPENAI_MODEL` defaults to `gpt-6-luna`. The model picker includes GPT-6 Luna, GPT-6.1 Sol, GPT-6.1 Terra, GPT-6 Astra, and the existing GPT-5 presets. Select **Custom model** to enter another API model ID. Custom models must support the Responses API and structured outputs and be available to your API account.
 
-## Cost Optimization
+Reasoning defaults to the model's own setting. Presets expose their supported effort levels; invalid combinations are rejected before starting a session. Custom-model settings are ultimately validated by OpenAI. Models are never silently substituted.
 
-- Uses GPT-4o-mini (90% cheaper than GPT-4)
-- Efficient prompt engineering
-- Action batching to reduce API calls
-- Configurable timeouts to prevent runaway costs
+`OPENAI_SERVICE_TIER=default` uses Standard processing. Set it to `flex` for Flex processing where your model supports it. Requests and retries remain bounded by the session time limit; the app does not fall back to a more expensive tier.
 
-## License
+Cost estimates use response usage and published model rates, including cached input and Flex adjustments. They are estimates, not invoices; custom models or unrecognized billing details display **Unavailable**. The session total covers solving, not subsequent write-up generation.
 
-MIT License - see LICENSE file for details.
+## Solver images
 
-## Troubleshooting
+The standard image uses Ubuntu 24.04, a Python virtual environment, and Node.js 24. It includes curl, wget, nmap, netcat, tcpdump, tshark, OpenSSL, hashcat, john, binutils, LLVM, gdb, binwalk, foremost, steghide, archive tools, build tools, and PostgreSQL client utilities. Python libraries include pwntools, angr, Capstone, Z3, cryptography, requests, Scapy, NumPy, and SciPy. GUI tools such as Ghidra and Burp are not bundled.
 
-**Docker Issues**: Ensure Docker daemon is running and user has permissions
-**API Errors**: Verify OpenAI API key and model availability
-**WebSocket Disconnections**: Check network connectivity and firewall settings
-**Container Failures**: Review Docker logs and resource availability
+For SageMath, set `SOLVER_TARGET=sage` in `.env` and rebuild. Sage runs in an isolated conda-forge environment; this image requires substantially more download space and build time. Both build definitions use architecture-native dependencies for ARM64 and AMD64.
 
-For more help, check the issues section or create a new issue.
+To use a registry mirror, set `SOLVER_BASE_IMAGE` to an Ubuntu 24.04-compatible image. For a manual build:
+
+```sh
+docker build --target standard -t ctf-agent:latest -f docker/Dockerfile docker
+# Optional Sage variant:
+docker build --target sage -t ctf-agent:sage -f docker/Dockerfile docker
+```
+
+The backend uses `ctf-agent:latest`. Compose tags the selected build target with that name.
+
+## Data and lifecycle
+
+Sessions and their action histories live in memory and disappear when the backend restarts. Uploaded files and the saved flag default remain in the existing `ctf-data` volume when using Compose. Generated write-ups are saved under `data/writeups` on the host. Manual development stores these under the local `data` directory. Do not use `docker compose down -v` if you want to retain the volume.
+
+Stopping a session, reaching its deadline, or finding a flag terminates its solver container. Container workspaces are removed during cleanup. Save a completed session's write-up before restarting the backend.
+
+## Development and tests
+
+Install Python 3.13 and [uv](https://docs.astral.sh/uv/), then:
+
+```sh
+uv sync
+uv run python -m backend.main
+uv run pytest -q
+```
+
+Build the solver image first and ensure Docker is running. Missing credentials or unavailable Docker leave the UI accessible but disable starting challenges. `/health` reports whether the agent initialized.
+
+Dependencies are maintained in `pyproject.toml` and locked in `uv.lock`. After changing them, regenerate Docker's requirements:
+
+```sh
+uv lock
+uv export --no-dev --no-emit-project --format requirements-txt -o requirements.txt
+```
+
+The tests mock OpenAI and Docker by default and do not make paid requests. The frontend consists of Jinja templates, a local stylesheet, shared utilities, and separate workspace/dashboard scripts.
+
+## API
+
+- `GET /models`: presets, capabilities, prices, and configured defaults.
+- `POST /challenges/start`: multipart challenge submission, including optional model, reasoning effort, and handouts.
+- `GET /challenges`: sessions; optionally filter by status.
+- `GET /challenges/{session_id}`: session metadata, usage, and actions.
+- `GET /challenges/{session_id}/actions`: action history.
+- `POST /challenges/{session_id}/upload`: add a handout.
+- `POST /challenges/{session_id}/stop`: stop a pending or running session.
+- `POST /challenges/{session_id}/save`: generate a write-up using the selected session model.
+- `DELETE /challenges/{session_id}`: delete a session.
+- `WS /ws/{session_id}`: live events, supporting multiple viewers.
+- `GET/POST /settings/flag-format`: read or update the default flag pattern.
+
+`scripts/ctfd_ingest.py` can submit CTFd challenges. Its model and reasoning arguments are optional, so omitted settings use the backend defaults. Run it with `--help` for options.

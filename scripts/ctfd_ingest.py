@@ -73,12 +73,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="gpt-5-mini",
+        default=os.getenv("OPENAI_MODEL"),
         help="Model name to pass through to the backend solver.",
     )
     parser.add_argument(
         "--reasoning-effort",
-        default="low",
+        default=None,
         help="Reasoning effort hint to send to the backend solver.",
     )
     parser.add_argument(
@@ -188,6 +188,7 @@ class CTFdClient:
             method, url, timeout=30, verify=self.verify_tls, **kwargs
         )
         response.raise_for_status()
+        print(response.text)
         data = response.json()
         if isinstance(data, dict) and not data.get("success", True):
             detail = data.get("data") or data
@@ -595,8 +596,8 @@ def post_challenge_to_backend(
     url = f"{backend_url.rstrip('/')}/challenges/start"
     payload: Dict[str, Any] = {
         "challenge_name": challenge.get("name", f"Challenge {challenge.get('id')}"),
-        "model": args.model,
-        "reasoning_effort": args.reasoning_effort,
+        **({"model": args.model} if args.model else {}),
+        **({"reasoning_effort": args.reasoning_effort} if args.reasoning_effort else {}),
         "timeout": str(args.backend_timeout),
     }
 
